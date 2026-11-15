@@ -12,6 +12,7 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { AlertCircle, Check, FileUp, Info, Loader2, Sparkles } from 'lucide-react';
 import type { AgentCli } from '@/services/projects';
+import { HelpTip } from '@/components/help/HelpTip';
 
 interface Props {
   projectId: string;
@@ -140,6 +141,7 @@ export function ComposePanel({ projectId, intentId, agentCli, disabled, onApply 
         <div className="flex items-center gap-2">
           <Sparkles className="h-4 w-4 text-muted-foreground" />
           <Label className="text-sm font-medium">Compose with AI</Label>
+          <HelpTip topic="compose.ai" />
         </div>
         <p className="text-xs text-muted-foreground">
           Agent will evaluate and propose most appropriate stages for this intent

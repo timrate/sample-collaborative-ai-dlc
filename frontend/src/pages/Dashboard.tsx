@@ -49,6 +49,7 @@ import {
   PROJECT_SORT_LABELS,
   type ProjectSort,
 } from '@/hooks/useProjectSort';
+import { HelpTip } from '@/components/help/HelpTip';
 
 function formatRelativeTime(dateStr: string | null | undefined): string {
   if (!dateStr) return '—';
@@ -167,7 +168,10 @@ export default function Dashboard() {
           <div className="flex items-center gap-4">
             <img src={getBranding().logo} alt={getBranding().name} className="h-14 w-14 shrink-0" />
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">Spaces</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-3xl font-bold tracking-tight">Spaces</h1>
+                <HelpTip topic="spaces.overview" side="right" />
+              </div>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Shared workspaces where people and AI agents build together
               </p>

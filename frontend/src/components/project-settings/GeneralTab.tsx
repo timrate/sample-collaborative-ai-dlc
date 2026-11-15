@@ -22,6 +22,7 @@ import {
 import { invalidateProjects } from '@/hooks/useProjectsCache';
 import { SettingsCard } from '@/components/settings/SettingsCard';
 import { SaveStatusButton, type SaveResult } from '@/components/settings/SaveStatusButton';
+import { HelpTip } from '@/components/help/HelpTip';
 
 interface Props {
   project: Project;
@@ -139,9 +140,12 @@ export function GeneralTab({ project, canEdit, onProjectUpdated }: Props) {
         icon={<SlidersHorizontal />}
         title="Runtime"
         badge={
-          <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 font-mono text-[11px] font-medium leading-4 text-muted-foreground">
-            {project.workflowId ?? 'aidlc-v2'}
-          </span>
+          <>
+            <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 font-mono text-[11px] font-medium leading-4 text-muted-foreground">
+              {project.workflowId ?? 'aidlc-v2'}
+            </span>
+            <HelpTip topic="space.runtime" />
+          </>
         }
         description="Execution knobs for this space — the workflow is pinned at creation; scope is chosen per-intent."
       >

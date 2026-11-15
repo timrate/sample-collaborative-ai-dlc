@@ -29,6 +29,7 @@ import { sourceControlService } from '@/services/sourceControl';
 import { postPresignedUpload } from '@/services/presignedUpload';
 import type { GitProvider } from '@/services/gitProvider';
 import { humanizeStageId } from './documentHelpers';
+import { HelpTip } from '@/components/help/HelpTip';
 
 // Files the importer reads. Everything else in a workspace (harness, code
 // repositories) is skipped, so a branch import only fetches these.
@@ -191,7 +192,10 @@ export function NativeImportDialog({
     <Dialog open={open} onOpenChange={(next) => !next && busy === null && onClose()}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Import CLI progress</DialogTitle>
+          <div className="flex items-center gap-1.5">
+            <DialogTitle>Import CLI progress</DialogTitle>
+            <HelpTip topic="intent.importCli" side="right" />
+          </div>
           <DialogDescription>
             Bring back work done in the AI-DLC CLI on a workspace exported from this intent. Stages
             the CLI completed are recorded here, their outputs are marked as imported, and the

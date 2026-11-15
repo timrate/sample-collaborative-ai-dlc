@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **Import CLI progress.** A project member can bring workflow progress made in a native AI-DLC harness back to the intent it was exported from, from the workspace ZIP or from a workspace repository branch. Sequential stages the CLI completed are recorded, with their artifacts (marked as imported) and question answers. The intent then waits to be continued at the next stage. The import shows a preview first, and refuses a workspace when the intent changed in the UI after the export. Construction unit progress is not imported yet. See [Importing CLI Progress](docs/using-the-platform/importing-cli-progress.md).
+- **In-app help.** A **Help** menu in the header links to the main user guides. Fields and sections that the screen did not explain now have a **?** button, which opens a short explanation and a link to the matching section of the documentation. These cover the New Intent and Compose fields, the space intent list and runtime settings, workflows, the block library, scope wiring, and CLI progress import. The help works with a click, the keyboard and touch. The help text lives in one registry (`frontend/src/lib/help-topics.ts`), and a test fails when a linked page or heading no longer exists.
 
 ### Notes
 

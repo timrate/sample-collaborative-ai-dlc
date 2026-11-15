@@ -54,6 +54,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { HelpTip } from '@/components/help/HelpTip';
 
 type ScopeSummary = {
   executedStages: number;
@@ -806,7 +807,10 @@ function IntentComposePageContent() {
 
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
-              <Label className="text-sm font-medium">Attachments</Label>
+              <div className="flex items-center gap-1.5">
+                <Label className="text-sm font-medium">Attachments</Label>
+                <HelpTip topic="compose.attachments" />
+              </div>
               <input
                 ref={attachmentInput}
                 type="file"
@@ -926,6 +930,7 @@ function IntentComposePageContent() {
             <div className="flex items-center gap-2">
               <Bot className="h-4 w-4 text-muted-foreground" />
               <Label className="text-sm font-medium">Agent CLI</Label>
+              <HelpTip topic="compose.agentCli" />
               {capabilitiesLoading && (
                 <Loader2
                   className="h-3.5 w-3.5 animate-spin text-muted-foreground"
@@ -1029,7 +1034,10 @@ function IntentComposePageContent() {
           </div>
 
           <div className="space-y-2">
-            <Label className="text-sm font-medium">Scope</Label>
+            <div className="flex items-center gap-1.5">
+              <Label className="text-sm font-medium">Scope</Label>
+              <HelpTip topic="compose.scope" />
+            </div>
             <div className="grid gap-3 lg:grid-cols-3">
               {/* Predefined — pick a built-in scope (1/3) */}
               <div className="lg:col-span-1 border rounded-md p-3 space-y-1.5">
@@ -1112,6 +1120,7 @@ function IntentComposePageContent() {
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <Label className="text-sm font-medium">Stages</Label>
+                <HelpTip topic="compose.stages" />
                 {draft.composedGrid && scope && (
                   <button
                     type="button"
