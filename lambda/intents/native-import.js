@@ -344,17 +344,13 @@ const deleteSyncBaseline = async ({ s3, bucket, intentId, baselineId }) => {
 const importedArtifactId = (write) =>
   `imported-${sha256(`${write.stageId}\0${write.artifactType}`).slice(0, 16)}`;
 
-// Writes everything the plan changes except META and run retirement, which
-// the handler owns. Order: artifacts (the slowest, Neptune) first, then gate
-// answers, then stage rows, so a failure leaves stages unfinished rather than
-// complete without their outputs.
-const writeImportedRecords = async ({
-  store,
+// Writes the plan's artifact versions (Neptune). Shared by the import
+// endpoint and the in-run sync, which commits its stage rows separately.
+const writeImportedArtifacts = async ({
   createWriter,
   applyArtifactEdit,
   intentId,
   projectId,
-  aidlcRepoRef,
   plan,
   importId,
   actor,
@@ -392,6 +388,35 @@ const writeImportedRecords = async ({
     });
     artifactIds.push(artifactId);
   }
+  return artifactIds;
+};
+
+// Writes everything the plan changes except META and run retirement, which
+// the handler owns. Order: artifacts (the slowest, Neptune) first, then gate
+// answers, then stage rows, so a failure leaves stages unfinished rather than
+// complete without their outputs.
+const writeImportedRecords = async ({
+  store,
+  createWriter,
+  applyArtifactEdit,
+  intentId,
+  projectId,
+  aidlcRepoRef,
+  plan,
+  importId,
+  actor,
+  now,
+}) => {
+  const artifactIds = await writeImportedArtifacts({
+    createWriter,
+    applyArtifactEdit,
+    intentId,
+    projectId,
+    plan,
+    importId,
+    actor,
+    now,
+  });
 
   const answered = [];
   for (const { humanTaskId, answer } of plan.answers) {
@@ -462,5 +487,6 @@ export {
   storeSyncBaseline,
   syncBaselineKey,
   validateBranchSource,
+  writeImportedArtifacts,
   writeImportedRecords,
 };

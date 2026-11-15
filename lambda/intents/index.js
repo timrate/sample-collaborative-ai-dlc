@@ -173,6 +173,7 @@ import {
   sourceControlGitProvider,
   storeSyncBaseline,
   validateBranchSource,
+  writeImportedArtifacts,
   writeImportedRecords,
 } from './native-import.js';
 import {
@@ -625,6 +626,18 @@ const getConnection = async () => {
   credentials.region = process.env.AWS_REGION ?? 'us-east-1';
   const { url, headers } = getUrlAndHeaders(host, port, credentials, '/gremlin', protocol);
   return new DriverRemoteConnection(url, { headers });
+};
+
+const graphTraversal = (conn) => {
+  const g = traversal().withRemote(conn);
+  if (!process.env.GREMLIN_PARTITION) return g;
+  return g.withStrategies(
+    new PartitionStrategy({
+      partitionKey: '_partition',
+      writePartition: process.env.GREMLIN_PARTITION,
+      readPartitions: [process.env.GREMLIN_PARTITION],
+    }),
+  );
 };
 
 // Model pricing (READ path). Prices live in SSM (`${prefix}/model-pricing`, the
@@ -2408,8 +2421,9 @@ const handleImportUpload = async ({ event, body, projectId, intentId, response }
 };
 
 // The intent's records projected exactly as an export of `manifest` saw
-// them: live records (an import target is never RUNNING), the pinned plan,
-// and the same distribution alignment.
+// them: live records, the pinned plan, and the same distribution alignment.
+// The import endpoint projects a parked intent; the in-run sync projects a
+// RUNNING one between stages, which the plan's row checks fence.
 const loadImportProjection = async ({ g, projectId, intentId, meta, manifest }) => {
   const records = await store.getExecutionRecords(intentId, { includeOutputs: false });
   const planResult = await loadNativeExportPlan(meta);
@@ -2786,6 +2800,169 @@ const handleUnlinkCliSync = async ({ event, projectId, intentId, response }) => 
     unlinked: true,
     intent: mapIntent({ ...meta, ...updated, cliSync: undefined }),
   });
+};
+
+// Internal action `sync-cli-progress` (direct invoke, no API route). The
+// orchestrator calls it between sequential stages of a run linked to a CLI
+// branch (docs/fork-plan/cli-progress-sync-design.md). Unlike the import
+// endpoint it does not retire the run: the calling run keeps walking, and the
+// stage rows and the baseline switch commit together only while that run
+// still owns the RUNNING intent. Expected outcomes are results; an unexpected
+// failure throws, and the caller's durable step retries it.
+const CLI_SYNC_ACTOR = Object.freeze({ sub: 'cli-sync', displayName: 'CLI sync' });
+const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
+
+const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
+  if (![projectId, intentId, orchestratorRunId].every(isNonEmptyString)) {
+    return {
+      ok: false,
+      code: 'cli_sync_invalid',
+      error: 'projectId, intentId and orchestratorRunId are required',
+    };
+  }
+  logger.appendKeys({ projectId, intentId });
+  const meta = await store.getExecution(intentId, { consistentRead: true });
+  if (!meta || meta.projectId !== projectId) {
+    return { ok: false, code: 'cli_sync_not_found', error: 'Intent not found' };
+  }
+  if (meta.status !== 'RUNNING' || meta.orchestratorRunId !== orchestratorRunId) {
+    return { ok: false, code: 'cli_sync_not_owner', error: 'The run no longer owns this intent' };
+  }
+  const link = meta.cliSync ?? null;
+  if (!link) return { ok: true, status: 'not_linked' };
+
+  let headSha = null;
+  let conn;
+  try {
+    const read = await readWorkspaceBranch({
+      provider: sourceControlGitProvider({
+        operate: sourceControlOperation,
+        projectId,
+        provider: link.provider,
+        repo: link.repo,
+      }),
+      ctx: null,
+      repoId: link.repo,
+      branch: link.branch,
+      knownHeadSha: link.lastSyncedSha ?? null,
+    });
+    headSha = read.headSha;
+    if (read.unchanged) return { ok: true, status: 'unchanged', headSha };
+
+    conn = await getConnection();
+    const g = graphTraversal(conn);
+    const manifest = readExportManifest(read.files);
+    const current = await loadImportProjection({ g, projectId, intentId, meta, manifest });
+    const baseline = await loadSyncBaseline({
+      s3,
+      bucket: ARTIFACTS_BUCKET(),
+      intentId,
+      baselineId: link.baselineId,
+    });
+    const now = new Date().toISOString();
+    const plan = planSync({ files: read.files, current, baseline, headSha, now });
+    if (plan.conflicts.length > 0) {
+      return { ok: true, status: 'conflict', headSha, conflicts: plan.conflicts };
+    }
+    // Answering a gate parks and wakes runs; mid-walk that belongs to the
+    // gate's own flow, not to a sync.
+    if (plan.answers.length > 0) {
+      return {
+        ok: false,
+        code: 'cli_sync_gate_open',
+        error: 'The CLI finished a stage whose gate is still open in the UI',
+        headSha,
+      };
+    }
+
+    const baselineId = await storeSyncBaseline({
+      s3,
+      bucket: ARTIFACTS_BUCKET(),
+      intentId,
+      baseline: plan.baseline,
+    });
+    const rowState = new Map(
+      (current.stageRows ?? []).map((row) => [row.stageInstanceId, row.state]),
+    );
+    try {
+      // Artifacts first: a failure after them leaves UI and CLI content equal,
+      // which the retried plan treats as agreement, not as a conflict.
+      await writeImportedArtifacts({
+        createWriter: (scope) => createGraphWriter({ g, scope }),
+        applyArtifactEdit: (input) => applyArtifactEdit({ g, ...input }),
+        intentId,
+        projectId,
+        plan,
+        importId: `cli-sync-${headSha}`,
+        actor: CLI_SYNC_ACTOR,
+        now,
+      });
+      await store.completeSyncedStages({
+        executionId: intentId,
+        orchestratorRunId,
+        completions: plan.stageCompletions.map((completion) => ({
+          ...completion,
+          expectedState: rowState.get(completion.stageInstanceId) ?? null,
+        })),
+        aidlcRepoRef: meta.aidlcRepoRef ?? plan.upstreamRef,
+        cliSync: { ...link, baselineId, lastSyncedSha: headSha, lastSyncedAt: now },
+      });
+    } catch (error) {
+      await deleteSyncBaseline({ s3, bucket: ARTIFACTS_BUCKET(), intentId, baselineId });
+      if (error?.name === 'ConditionalCheckFailedException') {
+        return {
+          ok: false,
+          code: 'cli_sync_changed',
+          error: 'The intent changed while the sync ran; nothing was imported',
+          headSha,
+        };
+      }
+      throw error;
+    }
+    await deleteSyncBaseline({
+      s3,
+      bucket: ARTIFACTS_BUCKET(),
+      intentId,
+      baselineId: link.baselineId,
+    });
+    const imported = plan.stageCompletions.map((completion) => completion.stageId);
+    if (hasRecordChanges(plan)) {
+      await store
+        .appendEvent({
+          executionId: intentId,
+          type: 'v2.cli.synced',
+          actor: CLI_SYNC_ACTOR.displayName,
+          summary: `Synced CLI progress from ${link.repo}@${link.branch} at ${headSha.slice(0, 12)}: ${imported.length ? imported.join(', ') : 'no stages'}, ${plan.artifactWrites.length} artifact(s)`,
+        })
+        .catch((err) => logger.error('CLI sync event append failed', err));
+    }
+    return {
+      ok: true,
+      status: 'synced',
+      headSha,
+      imported,
+      artifacts: plan.artifactWrites.length,
+      continuationStageId: plan.continuationStageId ?? null,
+    };
+  } catch (error) {
+    if (typeof error?.code === 'string' && error.code.startsWith('import_')) {
+      return {
+        ok: false,
+        code: error.code,
+        error: error.message.replace(/^native-import: /, ''),
+        headSha,
+      };
+    }
+    throw error;
+  } finally {
+    if (conn) {
+      try {
+        await conn.close();
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
 };
 
 // POST /projects/{projectId}/intents/{intentId}/realtime-token
@@ -7186,6 +7363,7 @@ export const handler = async (event, context) => {
   if (event?.action === 'repair-durable-executions') {
     return runDurableExecutionWatchdog(event);
   }
+  if (event?.action === 'sync-cli-progress') return runCliSync(event);
   if (
     event?.action === 'reconcile-provider-state' ||
     (event?.source === 'aws.events' && event?.['detail-type'] === 'Scheduled Event')
@@ -7216,16 +7394,7 @@ export const handler = async (event, context) => {
   let conn;
   try {
     conn = await getConnection();
-    let g = traversal().withRemote(conn);
-    if (process.env.GREMLIN_PARTITION) {
-      g = g.withStrategies(
-        new PartitionStrategy({
-          partitionKey: '_partition',
-          writePartition: process.env.GREMLIN_PARTITION,
-          readPartitions: [process.env.GREMLIN_PARTITION],
-        }),
-      );
-    }
+    const g = graphTraversal(conn);
 
     const auth = await authorize(g, projectId, sub, response);
     if (auth.res) return auth.res;
