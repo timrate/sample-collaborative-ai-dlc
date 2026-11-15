@@ -3174,6 +3174,82 @@ describe('POST /projects/{id}/intents/{intentId}/import (CLI re-attach)', () => 
     expect(baselineWrites()).toBe(writesBefore);
   });
 
+  const conflicted = async () => {
+    const context = await running();
+    const { intentId, cli, branch } = context;
+    await g
+      .V()
+      .has('Artifact', 'id', 'requirements')
+      .has('intent_id', intentId)
+      .property(gremlin.process.cardinality.single, 'content', '# Requirements\n\nUI edit.\n')
+      .next();
+    const requirements = pathEnding(cli, '/requirements-analysis/requirements.md');
+    branch.files.set(requirements, '# Requirements\n\nCLI edit.\n');
+    branch.headSha = 'd'.repeat(40);
+    return { ...context, requirements };
+  };
+  const keepUiWork = (projectId, intentId, expectedHeadSha) =>
+    handler({
+      action: 'sync-cli-progress',
+      projectId,
+      intentId,
+      orchestratorRunId: 'run-2',
+      resolve: 'keep-ui',
+      expectedHeadSha,
+    });
+
+  it("keeps the UI's work for the conflicts the gate showed, and the next sync is quiet", async () => {
+    const { projectId, intentId, requirements, branch } = await conflicted();
+    const before = meta(intentId);
+
+    expect(await keepUiWork(projectId, intentId, 'd'.repeat(40))).toEqual({
+      ok: true,
+      status: 'synced',
+      headSha: 'd'.repeat(40),
+      imported: [],
+      artifacts: 0,
+      continuationStageId: 'workflow-planning',
+      keptUi: [{ kind: 'artifact', path: requirements, stageId: 'requirements-analysis' }],
+    });
+    const content = await g
+      .V()
+      .has('Artifact', 'id', 'requirements')
+      .has('intent_id', intentId)
+      .values('content')
+      .next();
+    expect(content.value).toBe('# Requirements\n\nUI edit.\n');
+    expect(meta(intentId).cliSync.baselineId).not.toBe(before.cliSync.baselineId);
+
+    branch.headSha = 'f'.repeat(40);
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: true,
+      status: 'synced',
+      imported: [],
+    });
+  });
+
+  it('refuses to resolve conflicts for a head the gate did not show', async () => {
+    const { projectId, intentId } = await conflicted();
+    const before = meta(intentId);
+
+    expect(await keepUiWork(projectId, intentId, 'c'.repeat(40))).toMatchObject({
+      ok: false,
+      code: 'cli_sync_head_moved',
+      headSha: 'd'.repeat(40),
+    });
+    expect(meta(intentId)).toEqual(before);
+    expect(
+      await handler({
+        action: 'sync-cli-progress',
+        projectId,
+        intentId,
+        orchestratorRunId: 'run-2',
+        resolve: 'keep-cli',
+        expectedHeadSha: 'd'.repeat(40),
+      }),
+    ).toMatchObject({ ok: false, code: 'cli_sync_invalid' });
+  });
+
   it('returns the refusal code when the CLI rewound a completed stage', async () => {
     const { projectId, intentId, cli, branch } = await running();
     const state = pathEnding(cli, '/aidlc-state.md');

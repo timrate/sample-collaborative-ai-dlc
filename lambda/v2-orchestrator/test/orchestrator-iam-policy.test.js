@@ -22,4 +22,26 @@ describe('v2-orchestrator IAM role policy', () => {
     expect(processTableAction).toBeTruthy();
     expect(processTableAction).toContain('"dynamodb:ConditionCheckItem"');
   });
+
+  it('can invoke the intents Lambda for CLI sync, and is told its name', async () => {
+    // The CLI sync step (index.js defaultSyncCliProgress) invokes the intents
+    // Lambda's internal sync-cli-progress action by INTENTS_FUNCTION.
+    const terraform = await readFile(terraformPath, 'utf8');
+    const orchestratorPolicy = terraform.match(
+      /resource "aws_iam_role_policy" "v2_orchestrator" \{([\s\S]*?)^\}/m,
+    )?.[1];
+    expect(orchestratorPolicy).toMatch(
+      /Action\s*=\s*\["lambda:InvokeFunction"\]\s*Resource\s*=\s*\[local\.intents_function_arn\]/,
+    );
+    const orchestratorModule = terraform.match(
+      /module "v2_orchestrator_lambda" \{([\s\S]*?)^\}/m,
+    )?.[1];
+    expect(orchestratorModule).toMatch(/INTENTS_FUNCTION\s*=\s*local\.intents_function_name/);
+    expect(terraform).toMatch(
+      /intents_function_name\s*=\s*"\$\{var\.project_name\}-intents-\$\{var\.environment\}"/,
+    );
+    expect(terraform).toMatch(
+      /module "intents_lambda" \{[\s\S]*?function_name = "\$\{var\.project_name\}-intents-\$\{var\.environment\}"/,
+    );
+  });
 });

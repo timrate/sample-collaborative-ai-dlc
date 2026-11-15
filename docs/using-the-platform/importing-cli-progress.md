@@ -51,7 +51,23 @@ When the CLI and the UI both keep working on an intent, select **Keep syncing fr
 
 While an intent is linked, the intent page shows **Syncing CLI progress from <repository>@<branch>**. **Intent actions** then offers **Sync CLI progress**, which imports from the linked branch only, and **Unlink CLI branch**. Unlink to import from a ZIP or another branch again. Any project member can link or unlink.
 
-Syncing runs only when someone imports. Automatic syncing between stages is planned as a follow-up.
+### Automatic sync between stages
+
+A run that starts while the intent is linked also syncs on its own, before each sequential stage:
+
+- Stages the CLI finished are imported and the run moves past them without running them again. If the CLI finished every remaining stage, the run completes.
+- When nothing was pushed, the run goes on after one quick check of the branch.
+- If the sync cannot run (the branch can't be read, or the CLI workspace changed scope or moved a stage backwards), the timeline shows **CLI progress was not synced**, once for each pushed version, and the run goes on without it. The next stage tries again.
+- Construction stages that run per unit are not synced, the same as for an import.
+
+The link takes effect when a run starts. Linking needs a parked intent, so a run that is resumed from a gate keeps going without automatic sync. A run started by **Continue at <stage>**, a rewind or a retry syncs.
+
+When the CLI and the UI both changed the same stage or artifact, the run stops at a **CLI sync conflict** gate that lists them. Answer it with:
+
+- **keep-ui-work**: keep the UI's version of the listed items and import the rest of the CLI's progress. Later syncs treat those items as the UI's, so the same conflict is not raised again.
+- **stop-run**: fail the run. Reconcile the two sides, for example by exporting the intent and importing it again, then rewind.
+
+If someone pushes to the branch while the gate is open, the run syncs again before it acts on the answer, so a conflict nobody saw is never resolved for you.
 
 The sync state is kept in the artifacts bucket under `workflow-sync/<intentId>/` until the branch is unlinked or the intent is deleted.
 

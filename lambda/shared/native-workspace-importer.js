@@ -757,6 +757,10 @@ const advanceSyncBaseline = ({
   manifest,
   plan,
   conflictedStageIds = new Set(),
+  // "Keep the UI's work" on a conflict: these move to the CLI's side without
+  // being imported, so the next sync sees only the UI's change there.
+  acceptedFiles = new Map(),
+  acceptedStageIds = new Set(),
   headSha,
   now,
 }) => {
@@ -771,6 +775,7 @@ const advanceSyncBaseline = ({
       nextFiles[path] = sha256(text);
     }
   }
+  for (const [path, sha] of acceptedFiles) nextFiles[path] = sha;
   const stageRows = after.stageRows ?? [];
   return {
     schemaVersion: SYNC_BASELINE_VERSION,
@@ -784,8 +789,9 @@ const advanceSyncBaseline = ({
       projected.stages.map((stage) => [
         stage.stageId,
         {
-          marker:
-            incoming.get(stage.stageId) === stage.marker && !conflictedStageIds.has(stage.stageId)
+          marker: acceptedStageIds.has(stage.stageId)
+            ? incoming.get(stage.stageId)
+            : incoming.get(stage.stageId) === stage.marker && !conflictedStageIds.has(stage.stageId)
               ? stage.marker
               : (previous.stages[stage.stageId]?.marker ?? stage.marker),
           // The UI's own stage row at this sync. A stage the UI starts later
@@ -817,13 +823,20 @@ const createSyncBaseline = ({ files: rawFiles, current, plan, headSha = null, no
   return advanceSyncBaseline({ previous, files, current, manifest, plan, headSha, now });
 };
 
+// `resolveConflicts: 'keep-ui'` is the conflict gate's "Keep the UI's work":
+// the conflicts are returned as `keptUi` instead of `conflicts`, nothing in
+// them is imported, and the baseline moves past them (see advanceSyncBaseline).
 const planSync = ({
   files: rawFiles,
   current,
   baseline,
   headSha = null,
   now = new Date().toISOString(),
+  resolveConflicts = null,
 }) => {
+  if (resolveConflicts !== null && resolveConflicts !== 'keep-ui') {
+    throw new Error(`planSync: resolveConflicts must be 'keep-ui' or null`);
+  }
   const { files, manifest, projected } = openWorkspace({ rawFiles, current });
   assertSyncBaseline({ baseline, current });
 
@@ -857,6 +870,8 @@ const planSync = ({
   const exportedSha = new Map(manifest.files.map((entry) => [entry.path, entry.sha256]));
   const artifactConflicts = [];
   const uiOwnedFiles = [];
+  // CLI changes in conflicted stages or paths, for a keep-ui resolution.
+  const cliChangedInConflict = new Map();
   const paths = new Set([...files.keys(), ...projected.files.keys()]);
   for (const path of [...paths].toSorted((left, right) => left.localeCompare(right))) {
     if (path === 'export-manifest.json' || planner.isBookkeeping(path)) continue;
@@ -881,6 +896,9 @@ const planSync = ({
     // imported, and the CLI never commits the gitignored cursors.
     const cliChanged = cli !== null && cli !== base;
     const uiChanged = ui !== base;
+    if (cliChanged && conflictedStageIds.has(planner.locate(path).location?.stageId)) {
+      cliChangedInConflict.set(path, cli);
+    }
     if (!cliChanged) {
       if (uiChanged) uiOwnedFiles.push(path);
       continue;
@@ -895,6 +913,7 @@ const planSync = ({
         path,
         stageId: planner.locate(path).location?.stageId ?? null,
       });
+      cliChangedInConflict.set(path, cli);
     }
   }
 
@@ -902,9 +921,12 @@ const planSync = ({
     continuation,
     isRemoval: (path) => baseline.files[path] != null,
   });
+  const conflicts = [...stageConflicts, ...artifactConflicts];
+  const keepUi = resolveConflicts === 'keep-ui';
   return {
     ...plan,
-    conflicts: [...stageConflicts, ...artifactConflicts],
+    conflicts: keepUi ? [] : conflicts,
+    keptUi: keepUi ? conflicts : [],
     uiOwnedFiles,
     baseline: advanceSyncBaseline({
       previous: baseline,
@@ -912,7 +934,9 @@ const planSync = ({
       current,
       manifest,
       plan,
-      conflictedStageIds,
+      conflictedStageIds: keepUi ? new Set() : conflictedStageIds,
+      acceptedFiles: keepUi ? cliChangedInConflict : new Map(),
+      acceptedStageIds: keepUi ? conflictedStageIds : new Set(),
       headSha,
       now,
     }),

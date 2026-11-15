@@ -263,6 +263,24 @@ const defaultSourceControlOperation = async ({
   return body.result;
 };
 
+// CLI progress sync between stages (docs/fork-plan/cli-progress-sync-design.md,
+// "Internal sync action"): the intents Lambda's internal `sync-cli-progress`
+// action, which has the graph, the S3 baseline and the binding-checked branch
+// read. Returns the action's result object.
+const INTENTS_FN = () => process.env.INTENTS_FUNCTION;
+const defaultSyncCliProgress = async (payload) => {
+  if (!INTENTS_FN()) throw new Error('INTENTS_FUNCTION is not configured');
+  const response = await lambda.send(
+    new InvokeCommand({
+      FunctionName: INTENTS_FN(),
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify({ action: 'sync-cli-progress', ...payload })),
+    }),
+  );
+  if (response.FunctionError) throw new Error('CLI sync invocation failed');
+  return parseLambdaPayload(response.Payload);
+};
+
 // Map a timeline event type to the live broadcast payload the UI routes on
 // (useIntentEvents → refetch on agent.workspace / agent.execution). The
 // orchestrator is NOT VPC-attached and reaches the connections table over the
@@ -306,6 +324,7 @@ const defaultDeps = () => ({
     }),
   loadPlan: (args) => loadExecutionPlan({ ddb, tableName: BLOCKS_TABLE(), ...args }),
   invokeRuntime: defaultInvokeRuntime,
+  syncCliProgress: defaultSyncCliProgress,
   issueAgentCredentialGrant: (claims) => issueAgentCredentialGrant(ssm, claims),
   issueGatewayGrant: gatewayGrantIssuer,
   // Execution grants are signed only when they have a reader: engine data.
@@ -458,6 +477,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
     stopSession,
     broadcast,
     releaseCallback = null,
+    syncCliProgress = null,
     openPr,
     comparePrBranches,
     unitPrProvider,
@@ -713,6 +733,10 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // initWorkspace). Memoized with the claim, so a run that checkpointed
         // before this field existed replays the legacy `init-ws` step.
         initWsMode: INIT_WS_MODE_CALLBACK,
+        // Replay gate for the CLI sync step before each sequential stage.
+        // Memoized with the claim: a run claimed before it existed, or while
+        // the intent was not linked to a CLI branch, keeps its step sequence.
+        ...(meta.cliSync ? { cliSyncMode: CLI_SYNC_MODE } : {}),
       };
     });
     runId = claim.runId;
@@ -1370,6 +1394,98 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
     };
     sectionToolkit.runId = runId;
 
+    // ── CLI progress sync (docs/fork-plan/cli-progress-sync-design.md, B2) ──
+    // Before each once-per-workflow stage of a run claimed with cliSyncMode,
+    // import what the CLI finished on the linked branch. Both sets are rebuilt
+    // from memoized step results on replay. Stages the sync imported are passed
+    // over like a gate-time skip: their SUCCEEDED rows came from the import.
+    const cliImportedIds = new Set();
+    const cliSyncFailuresReported = new Set();
+    const callCliSync = (name, extra = {}) =>
+      ctx.step(name, async () => {
+        try {
+          return await syncCliProgress({
+            projectId,
+            intentId,
+            orchestratorRunId: runId,
+            ...extra,
+          });
+        } catch (error) {
+          // A sync outage never blocks the run; the next stage tries again.
+          logger.error('CLI sync invocation failed', { name, error: error?.message });
+          return { ok: false, code: 'cli_sync_unavailable', error: error?.message ?? null };
+        }
+      });
+    // Returns null to go on, or the walk's terminal value.
+    const syncCliBeforeStage = async (stage, key) => {
+      let round = 0;
+      let result = await callCliSync(`cli-sync-${key}`);
+      for (;;) {
+        if (result?.ok === true && result.status === 'conflict') {
+          const conflictHead = result.headSha;
+          const decision = await awaitCliSyncConflict(stage, `${key}-r${round}`, result);
+          if (decision) return decision;
+          result = await callCliSync(`cli-sync-keep-ui-${key}-r${round}`, {
+            resolve: 'keep-ui',
+            expectedHeadSha: conflictHead,
+          });
+          // A push while the gate was open may bring conflicts nobody saw.
+          if (result?.code === 'cli_sync_head_moved' && round < CLI_SYNC_MAX_ROUNDS) {
+            round += 1;
+            result = await callCliSync(`cli-sync-${key}-r${round}`);
+          }
+          continue;
+        }
+        if (result?.ok === true) {
+          // The action records the v2.cli.synced event with the import.
+          for (const stageId of result.imported ?? []) cliImportedIds.add(stageId);
+          return null;
+        }
+        if (result?.code === 'cli_sync_not_owner')
+          return { ok: false, reason: 'retired', intentId };
+        // Reported once per head and code, not once per stage.
+        const reportKey = `${result?.headSha ?? 'none'}:${result?.code ?? 'no_response'}`;
+        if (!cliSyncFailuresReported.has(reportKey)) {
+          cliSyncFailuresReported.add(reportKey);
+          await emitEvent(
+            ctx,
+            `cli-sync-failed-${key}-r${round}`,
+            'v2.cli.sync_failed',
+            `CLI progress was not synced before ${stage.stageId}: ${result?.code ?? 'no_response'}${
+              result?.error ? ` (${result.error})` : ''
+            }`,
+          );
+        }
+        return null;
+      }
+    };
+    // The conflict gate: keep the UI's work, or stop the run so a person can
+    // reconcile by exporting and importing again. Returns null to keep the
+    // UI's work, or the walk's terminal value.
+    const awaitCliSyncConflict = async (stage, key, result) => {
+      for (let attempt = 0; ; attempt += 1) {
+        const gate = await awaitEngineGate(ctx, sectionToolkit, {
+          name: `cli-sync-conflict-${key}${attempt ? `-a${attempt}` : ''}`,
+          stageLabel: stage.stageId,
+          prompt: cliSyncConflictPrompt({
+            link: meta.cliSync,
+            result,
+            stageId: stage.stageId,
+            reask: attempt > 0,
+          }),
+          options: CLI_SYNC_CONFLICT_OPTIONS,
+        });
+        if (gate.superseded) return { ok: false, reason: 'retired', intentId };
+        const choice = parseChoice(gate.gate.answer, CLI_SYNC_CONFLICT_OPTIONS);
+        if (!choice && attempt < CLI_SYNC_REASK_LIMIT) continue;
+        if (choice === 'keep-ui-work') return null;
+        return await fail(
+          'cli_sync_stopped',
+          `the CLI and the UI both changed work before ${stage.stageId}; export and import again to reconcile`,
+        );
+      }
+    };
+
     // ── The plan walk: alternating once-per-workflow segments and parallel
     // sections (docs/v2-parallel.md A2; detection is structural via forEach).
     const segments = planSegments(runStages);
@@ -1402,6 +1518,13 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // flip was approved. Replay-deterministic: dynamicSkipIds is rebuilt
         // from the same memoized gate answers on every replay.
         if (dynamicSkipIds.includes(stage.stageId)) continue;
+        if (claim.cliSyncMode === CLI_SYNC_MODE && !cliImportedIds.has(stage.stageId)) {
+          const passKey = loopBackPass ? `-loopback-${loopBackPass}` : '';
+          const terminal = await syncCliBeforeStage(stage, `${stage.stageId}${passKey}`);
+          if (terminal) return terminal;
+        }
+        // The CLI finished this stage; the import wrote its SUCCEEDED row.
+        if (cliImportedIds.has(stage.stageId)) continue;
         // Gate-time "skip to stage X" (stage-skip.js, upstream stage-protocol
         // §0.5): set by an approved validation answer below, applied after the
         // stage's post-hooks — intermediates get SKIPPED rows, the TARGET
@@ -2956,6 +3079,36 @@ const STAGE_CALLBACK_HEARTBEAT_TIMEOUT = { minutes: 15 };
 // Every outcome is returned in init-ws's own {ok, reason, detail} shape so the
 // caller's single decode path is unchanged.
 export const INIT_WS_MODE_CALLBACK = 'callback';
+// The claim's CLI sync replay gate (see the cli-sync steps in the walk).
+export const CLI_SYNC_MODE = 'v1';
+// The conflict gate's answers: keep the UI's work and move on, or stop.
+export const CLI_SYNC_CONFLICT_OPTIONS = ['keep-ui-work', 'stop-run'];
+// An unreadable conflict answer is asked again this often, then stops the run.
+const CLI_SYNC_REASK_LIMIT = 2;
+// Pushes during a conflict decision re-sync this often before the sync is
+// reported as failed for this stage (the next stage tries again).
+const CLI_SYNC_MAX_ROUNDS = 2;
+
+const cliSyncConflictLine = (conflict) =>
+  conflict.kind === 'artifact'
+    ? `- ${conflict.path}: changed in both the CLI and the UI${conflict.stageId ? ` (${conflict.stageId})` : ''}`
+    : conflict.reason === 'both_completed'
+      ? `- Stage ${conflict.stageId}: completed in both the CLI and the UI`
+      : `- Stage ${conflict.stageId}: completed in the CLI while it runs in the UI`;
+
+const cliSyncConflictPrompt = ({ link, result, stageId, reask }) =>
+  [
+    `CLI progress from ${link?.repo ?? 'the linked repository'}@${link?.branch ?? 'branch'} (${String(result.headSha ?? '').slice(0, 12)}) conflicts with work done in the UI, so nothing was imported before ${stageId}.`,
+    '',
+    ...(result.conflicts ?? []).map(cliSyncConflictLine),
+    '',
+    'Choose:',
+    "- keep-ui-work: keep the UI's version of these items and import the rest of the CLI's progress; later syncs treat these items as the UI's",
+    '- stop-run: fail the run, so you can reconcile by exporting and importing again',
+    ...(reask
+      ? ['', 'The previous answer could not be interpreted — choose keep-ui-work or stop-run.']
+      : []),
+  ].join('\n');
 // Bounds a clone that is still heartbeating but never finishes; generous
 // because a repository's size is not known up front.
 const INIT_WS_CALLBACK_TIMEOUT = { hours: 2 };

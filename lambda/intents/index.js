@@ -2812,12 +2812,28 @@ const handleUnlinkCliSync = async ({ event, projectId, intentId, response }) => 
 const CLI_SYNC_ACTOR = Object.freeze({ sub: 'cli-sync', displayName: 'CLI sync' });
 const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
 
-const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
+// `resolve: 'keep-ui'` is the conflict gate's "Keep the UI's work": it plans
+// the head the gate showed (`expectedHeadSha`), imports what does not
+// conflict and moves the baseline past the conflicts without importing them.
+const runCliSync = async ({
+  projectId,
+  intentId,
+  orchestratorRunId,
+  resolve = null,
+  expectedHeadSha = null,
+}) => {
   if (![projectId, intentId, orchestratorRunId].every(isNonEmptyString)) {
     return {
       ok: false,
       code: 'cli_sync_invalid',
       error: 'projectId, intentId and orchestratorRunId are required',
+    };
+  }
+  if (resolve !== null && (resolve !== 'keep-ui' || !isNonEmptyString(expectedHeadSha))) {
+    return {
+      ok: false,
+      code: 'cli_sync_invalid',
+      error: "resolve must be 'keep-ui', with the expectedHeadSha the conflict was shown for",
     };
   }
   logger.appendKeys({ projectId, intentId });
@@ -2848,6 +2864,16 @@ const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
     });
     headSha = read.headSha;
     if (read.unchanged) return { ok: true, status: 'unchanged', headSha };
+    // The person resolved the conflicts of one head; a later push may bring
+    // conflicts nobody has seen.
+    if (resolve && headSha !== expectedHeadSha) {
+      return {
+        ok: false,
+        code: 'cli_sync_head_moved',
+        error: 'The branch moved since the conflict was shown',
+        headSha,
+      };
+    }
 
     conn = await getConnection();
     const g = graphTraversal(conn);
@@ -2860,7 +2886,14 @@ const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
       baselineId: link.baselineId,
     });
     const now = new Date().toISOString();
-    const plan = planSync({ files: read.files, current, baseline, headSha, now });
+    const plan = planSync({
+      files: read.files,
+      current,
+      baseline,
+      headSha,
+      now,
+      resolveConflicts: resolve,
+    });
     if (plan.conflicts.length > 0) {
       return { ok: true, status: 'conflict', headSha, conflicts: plan.conflicts };
     }
@@ -2926,13 +2959,16 @@ const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
       baselineId: link.baselineId,
     });
     const imported = plan.stageCompletions.map((completion) => completion.stageId);
-    if (hasRecordChanges(plan)) {
+    if (hasRecordChanges(plan) || plan.keptUi.length > 0) {
+      const kept = plan.keptUi.length
+        ? `; kept the UI's work for ${plan.keptUi.length} conflicting item(s)`
+        : '';
       await store
         .appendEvent({
           executionId: intentId,
           type: 'v2.cli.synced',
           actor: CLI_SYNC_ACTOR.displayName,
-          summary: `Synced CLI progress from ${link.repo}@${link.branch} at ${headSha.slice(0, 12)}: ${imported.length ? imported.join(', ') : 'no stages'}, ${plan.artifactWrites.length} artifact(s)`,
+          summary: `Synced CLI progress from ${link.repo}@${link.branch} at ${headSha.slice(0, 12)}: ${imported.length ? imported.join(', ') : 'no stages'}, ${plan.artifactWrites.length} artifact(s)${kept}`,
         })
         .catch((err) => logger.error('CLI sync event append failed', err));
     }
@@ -2943,6 +2979,7 @@ const runCliSync = async ({ projectId, intentId, orchestratorRunId }) => {
       imported,
       artifacts: plan.artifactWrites.length,
       continuationStageId: plan.continuationStageId ?? null,
+      ...(resolve ? { keptUi: plan.keptUi } : {}),
     };
   } catch (error) {
     if (typeof error?.code === 'string' && error.code.startsWith('import_')) {

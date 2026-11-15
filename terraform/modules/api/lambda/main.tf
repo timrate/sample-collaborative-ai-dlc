@@ -47,7 +47,11 @@ locals {
     "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-v2-orchestrator-${var.environment}:*",
   ]
 
-  source_control_function_arn      = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-source-control-${var.environment}"
+  source_control_function_arn = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-source-control-${var.environment}"
+  # Built from the name, not the module: the intents Lambda already references
+  # the orchestrator, so a module reference back would be a cycle.
+  intents_function_name            = "${var.project_name}-intents-${var.environment}"
+  intents_function_arn             = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${local.intents_function_name}"
   credential_broker_function_arn   = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-credential-broker-${var.environment}"
   credential_metadata_function_arn = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-credential-metadata-${var.environment}"
   managed_agentcore_runtime_arn    = "arn:${local.partition}:bedrock-agentcore:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:runtime/*"
@@ -3472,6 +3476,13 @@ resource "aws_iam_role_policy" "v2_orchestrator" {
         Resource = [local.source_control_function_arn]
       },
       {
+        # CLI progress sync between stages: the intents Lambda's internal
+        # sync-cli-progress action (docs/fork-plan/cli-progress-sync-design.md).
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = [local.intents_function_arn]
+      },
+      {
         # Sign a fresh binding-scoped grant immediately before each AgentCore
         # invocation. The runtime can redeem it but cannot mint another.
         Effect   = "Allow"
@@ -3534,6 +3545,7 @@ module "v2_orchestrator_lambda" {
     ARTIFACTS_BUCKET                    = var.artifacts_bucket_name
     AGENTCORE_RUNTIME_ARN               = var.agentcore_runtime_arn
     SOURCE_CONTROL_FUNCTION             = module.source_control_lambda.lambda_function_name
+    INTENTS_FUNCTION                    = local.intents_function_name
     AGENT_CREDENTIAL_GRANT_SECRET_PARAM = var.agent_credential_grant_secret_param_name
     # Live realtime fan-out (lambda/shared/ws-fanout.js) — the orchestrator emits
     # execution/workspace lifecycle events on the intent:<id> channel itself, since

@@ -135,7 +135,7 @@ This replaces the runtime command (B1 step 3). It was decided on 2026-11-15, aft
 
 **Unlike the import endpoint**, the action does not retire the run, stop the runtime session, or set `importedContinuation`. The calling run keeps walking and moves past the imported stages (B2 item 3).
 
-**Results.** Expected outcomes are results, not errors. An unexpected failure throws, and the caller's durable step retries it.
+**Results.** Expected outcomes are results, not errors. An unexpected failure throws; B2 records it as a sync failure and the walk goes on (see "B2 as built").
 
 | Result                                                                              | Meaning                                                                                                                                                                      | Writes                                                                      |
 | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -154,7 +154,7 @@ This replaces the runtime command (B1 step 3). It was decided on 2026-11-15, aft
 **What this changes in B2.**
 
 - Item 2: the durable step invokes the intents Lambda action. B2 adds the orchestrator's invoke permission and a function-name environment variable, together with the caller.
-- Item 5: a write cannot fail part-way for stages, because they commit in one transaction. `cli_sync_changed` and `cli_sync_not_owner` mean the run lost the intent, and the walk exits the way it does for any ownership loss.
+- Item 5: a write cannot fail part-way for stages, because they commit in one transaction. `cli_sync_not_owner` means the run lost the intent, and the walk exits the way it does for any ownership loss. `cli_sync_changed` is reported as a sync failure, and the next stage plans again.
 
 ## B2: orchestrator step, gate and UI
 
@@ -180,6 +180,20 @@ This replaces the runtime command (B1 step 3). It was decided on 2026-11-15, aft
    - The intent header shows a "Syncing CLI progress from `<repo>@<branch>`" badge, with **Unlink** in Intent actions.
    - The timeline shows the new events.
    - The conflict gate renders in the existing gate card.
+
+### B2 as built
+
+Decided on 2026-11-15, during implementation.
+
+- **The step.** Before each stage of a once-per-workflow segment, `cli-sync-<stageId>` invokes the intents action (`INTENTS_FUNCTION`, direct invoke). A loop-back pass adds `-loopback-<n>` to the key, like the walk's other step names. Imported stages are kept in a set rebuilt from the memoized results, and the walk passes over them before dispatch.
+- **Replay gate.** The claim (`mint-run-id`) carries `cliSyncMode: 'v1'` only when `META.cliSync` is set at claim time. A run claimed before B2 deployed, or while unlinked, has no field and keeps its exact step sequence. A test strips the field from a real claim and compares the step names with an unlinked run.
+- **Linking takes effect at the next claim.** Linking needs a parked intent (the import statuses). A link that imports records retires the run, and **Continue** starts a new, syncing claim. A link with no records leaves the parked run alone, and its resume keeps the old claim, so it does not sync until the next rewind or relaunch. The user guide says so.
+- **The conflict gate is an `approval` engine gate, not a new kind.** `awaitEngineGate` and the gate card already render any engine gate's prompt and options. A new `cli-sync-conflict` kind would also need `HUMAN_TASK_KINDS` and frontend changes, with no behavior that depends on the kind. The gate name is `cli-sync-conflict-<key>-r<round>`. Its options are `keep-ui-work` and `stop-run`. An unreadable answer is asked again twice, then treated as `stop-run`, the same pattern as halt-and-ask.
+- **Keep the UI's work** calls the action again with `resolve: 'keep-ui'` and the head the gate showed. `planSync` then returns the conflicts as `keptUi`, imports the rest, and moves the baseline to the CLI's side for every conflicted path and every CLI-changed file in a conflicted stage. Moving only the conflicted paths would leave the CLI's other files in a kept stage looking like a CLI edit to a completed stage, which the next sync refuses. If the head moved while the gate was open, the action returns `cli_sync_head_moved`, and the walk syncs again (up to two more rounds) instead of resolving conflicts nobody saw.
+- **Stop the run fails it** (`cli_sync_stopped`) instead of cancelling, like halt-and-ask's abort, so the intent can be reconciled and rewound.
+- **Failures.** A thrown invocation becomes `cli_sync_unavailable` inside the step. Every refusal except `cli_sync_not_owner` records `v2.cli.sync_failed` once per (head, code) for the run, and the walk goes on. The action itself appends `v2.cli.synced` for an import, so the orchestrator adds no second event.
+- **Derived graph items.** An imported stage does not run `derive-artifacts`, the same as a stage imported by PR #1 and then passed by a rewind. Its artifact Markdown is in Neptune; the derived items and edges for it are not built until a later re-derive.
+- **No frontend change.** The B1 banner, menu and import dialog stay. The conflict gate renders in the existing gate card, and the new events render in the timeline as notes.
 
 ## Risks and open items
 
