@@ -203,6 +203,7 @@ const harness = ({ mode, supportRefs, env = {}, release = RELEASE_PIN, openGraph
     spawnFn: okSpawn,
     clock: () => 'T',
     commitAndPushAll: async () => ({ ok: true, committed: false, results: [] }),
+    syncAllBranches: async () => ({ ok: true, changed: false, conflicted: false, results: [] }),
     ...(openGraph ? { openGraph } : {}),
   };
   const args = { ...baseArgs, ...(release ? { methodologyRelease: release } : {}) };

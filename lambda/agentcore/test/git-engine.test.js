@@ -2574,3 +2574,226 @@ describe('shallow checkouts deepen on demand', () => {
     expect(res.conflicted).toBe(false);
   });
 });
+
+// ── Branch sync: pushes made to the working branch outside the session ──────
+
+import { syncBranchWithRemote, syncAllBranches, syncConflictBranchFor } from '../git-engine.js';
+
+const SYNC_BRANCH = 'aidlc/i1';
+// The session checkout sits on the intent branch, matching the remote.
+const setupSyncedCheckout = async () => {
+  const { remote, work } = await initRemoteAndClone();
+  await commitOnRemote(remote, SYNC_BRANCH, 'base.txt', 'base\n');
+  await fetchOrigin({ dir: work, repo: 'o/r', urls: laneUrls(remote) });
+  await git(['checkout', '-B', SYNC_BRANCH, `refs/remotes/origin/${SYNC_BRANCH}`], work);
+  return { remote, work };
+};
+const headOf = async (dir) => (await git(['rev-parse', 'HEAD'], dir)).stdout.trim();
+// Blob content, independent of the checkout's line-ending conversion.
+const blobAt = async (dir, file) => (await git(['show', `HEAD:${file}`], dir)).stdout;
+const remoteTip = async (remote, branch) =>
+  (await git(['ls-remote', remote, branch], root)).stdout.trim().split(/\s/)[0] ?? '';
+
+describe('syncBranchWithRemote', () => {
+  const sync = (work, remote) =>
+    syncBranchWithRemote({
+      dir: work,
+      repo: 'o/r',
+      branch: SYNC_BRANCH,
+      message: 'chore(aidlc): merge changes pushed to the branch',
+      urls: laneUrls(remote),
+    });
+
+  it('reports up_to_date when nobody pushed', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    const before = await headOf(work);
+    expect(await sync(work, remote)).toEqual({
+      synced: 'up_to_date',
+      sha: before,
+      previousSha: before,
+    });
+  });
+
+  it('fast-forwards onto a push made since the last stage', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    const before = await headOf(work);
+    await commitOnRemote(remote, SYNC_BRANCH, 'cli.txt', 'from the CLI\n');
+    const res = await sync(work, remote);
+    expect(res.synced).toBe('fast_forward');
+    expect(res.previousSha).toBe(before);
+    expect(res.sha).toBe(await remoteTip(remote, SYNC_BRANCH));
+    expect(await headOf(work)).toBe(res.sha);
+    expect(await blobAt(work, 'cli.txt')).toBe('from the CLI\n');
+    const parents = await git(['log', '-1', '--format=%P'], work);
+    expect(parents.stdout.trim().split(' ')).toHaveLength(1);
+  });
+
+  it('merges with the engine identity when both sides moved without conflict', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await writeFile(path.join(work, 'ui.txt'), 'from the UI\n');
+    const local = await commitAll({ dir: work, message: 'aidlc(x): local' });
+    await commitOnRemote(remote, SYNC_BRANCH, 'cli.txt', 'from the CLI\n');
+    const res = await sync(work, remote);
+    expect(res.synced).toBe('merged');
+    expect(res.previousSha).toBe(local.sha);
+    const parents = await git(['log', '-1', '--format=%P'], work);
+    expect(parents.stdout.trim().split(' ')).toHaveLength(2);
+    const who = await git(['log', '-1', '--format=%an|%s'], work);
+    expect(who.stdout.trim()).toBe(
+      'AI-DLC Engine|chore(aidlc): merge changes pushed to the branch',
+    );
+    expect(await blobAt(work, 'cli.txt')).toBe('from the CLI\n');
+    expect(await blobAt(work, 'ui.txt')).toBe('from the UI\n');
+    // The sync alone never pushes the working branch.
+    expect(await remoteTip(remote, SYNC_BRANCH)).not.toBe(res.sha);
+  });
+
+  it('on a conflict: aborts, keeps the tree, and publishes the local work to the conflict branch', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await writeFile(path.join(work, 'base.txt'), 'UI version\n');
+    const local = await commitAll({ dir: work, message: 'aidlc(x): local' });
+    await commitOnRemote(remote, SYNC_BRANCH, 'base.txt', 'CLI version\n');
+    const res = await sync(work, remote);
+    expect(syncConflictBranchFor(SYNC_BRANCH)).toBe('aidlc/i1--sync-conflict');
+    expect(res).toMatchObject({
+      synced: false,
+      reason: 'branch_sync_conflict',
+      conflicts: ['base.txt'],
+      conflictBranch: 'aidlc/i1--sync-conflict',
+    });
+    expect(await headOf(work)).toBe(local.sha);
+    expect((await git(['rev-parse', '--verify', 'MERGE_HEAD'], work)).exitCode).not.toBe(0);
+    expect((await git(['status', '--porcelain'], work)).stdout.trim()).toBe('');
+    expect(await remoteTip(remote, 'aidlc/i1--sync-conflict')).toBe(local.sha);
+    const { stdout } = await git(['remote', 'get-url', 'origin'], work);
+    expect(stdout.trim()).toBe('https://github.com/o/r.git');
+  });
+
+  it('fast-forwards on the next sync once a person merged the conflict branch', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await writeFile(path.join(work, 'base.txt'), 'UI version\n');
+    await commitAll({ dir: work, message: 'aidlc(x): local' });
+    await commitOnRemote(remote, SYNC_BRANCH, 'base.txt', 'CLI version\n');
+    await sync(work, remote);
+    // The person resolves outside the platform by merging the conflict branch.
+    const peer = await mkdtemp(path.join(root, 'resolver-'));
+    await git(['clone', remote, peer], root);
+    await git(['checkout', SYNC_BRANCH], peer);
+    await git(['fetch', 'origin', 'aidlc/i1--sync-conflict'], peer);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', 'FETCH_HEAD'], peer);
+    await writeFile(path.join(peer, 'base.txt'), 'resolved\n');
+    await git(['add', '-A'], peer);
+    await git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--no-edit'], peer);
+    await git(['push', 'origin', SYNC_BRANCH], peer);
+    const res = await sync(work, remote);
+    expect(res.synced).toBe('fast_forward');
+    expect(await blobAt(work, 'base.txt')).toBe('resolved\n');
+  });
+
+  it('treats a local-only commit as up_to_date (the push publishes it)', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await writeFile(path.join(work, 'ui.txt'), 'x\n');
+    const local = await commitAll({ dir: work, message: 'aidlc(x): local' });
+    expect(await sync(work, remote)).toEqual({
+      synced: 'up_to_date',
+      sha: local.sha,
+      previousSha: local.sha,
+    });
+  });
+
+  it('refuses to merge into uncommitted changes', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await commitOnRemote(remote, SYNC_BRANCH, 'cli.txt', 'x\n');
+    await writeFile(path.join(work, 'base.txt'), 'uncommitted\n');
+    expect(await sync(work, remote)).toMatchObject({ synced: false, reason: 'dirty_worktree' });
+    expect((await git(['diff', '--name-only'], work)).stdout.trim()).toBe('base.txt');
+  });
+
+  it('reports no_remote_branch for a branch that was never pushed', async () => {
+    const { remote, work } = await initRemoteAndClone();
+    await git(['checkout', '-b', 'aidlc/new'], work);
+    const res = await syncBranchWithRemote({
+      dir: work,
+      repo: 'o/r',
+      branch: 'aidlc/new',
+      urls: laneUrls(remote),
+    });
+    expect(res).toEqual({ synced: 'no_remote_branch' });
+  });
+
+  it('reports a fetch failure as a value', async () => {
+    const { work } = await setupSyncedCheckout();
+    const res = await syncBranchWithRemote({
+      dir: work,
+      repo: 'o/r',
+      branch: SYNC_BRANCH,
+      urls: { auth: path.join(root, 'missing.git'), clean: 'https://github.com/o/r.git' },
+    });
+    expect(res).toMatchObject({ synced: false, reason: 'fetch_failed' });
+  });
+
+  it('syncAllBranches aggregates changed and conflicted', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await commitOnRemote(remote, SYNC_BRANCH, 'cli.txt', 'x\n');
+    const res = await syncAllBranches({
+      repos: ['o/r'],
+      workspaceDir: work,
+      branch: SYNC_BRANCH,
+      urlsFor: () => laneUrls(remote),
+    });
+    expect(res).toMatchObject({ ok: true, changed: true, conflicted: false });
+    expect(res.results[0]).toMatchObject({ repo: 'o/r', synced: 'fast_forward' });
+  });
+});
+
+describe('commitAndPushAll — syncs before the push', () => {
+  const stageExit = (work, remote) =>
+    commitAndPushAll({
+      repos: ['o/r'],
+      workspaceDir: work,
+      branch: SYNC_BRANCH,
+      gitProvider: 'github',
+      message: 'aidlc(code-generation): e1',
+      syncMessage: 'chore(aidlc): merge changes pushed to the branch',
+      urlsFor: () => laneUrls(remote),
+      ...quiet,
+    });
+
+  it('merges a push made during the stage, pushes, and keeps the stage commit as sha', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await commitOnRemote(remote, SYNC_BRANCH, 'cli.txt', 'pushed mid-stage\n');
+    await writeFile(path.join(work, 'feature.js'), 'export const f = 1;\n');
+    const res = await stageExit(work, remote);
+    expect(res.ok).toBe(true);
+    expect(res.committed).toBe(true);
+    const [row] = res.results;
+    expect(row).toMatchObject({ committed: true, pushed: true, synced: 'merged' });
+    expect(row.files).toEqual(['feature.js']);
+    // `sha` is the stage commit: parked-leg file lists diff it.
+    const stageFiles = await git(
+      ['diff-tree', '--no-commit-id', '--name-only', '-r', row.sha],
+      work,
+    );
+    expect(stageFiles.stdout.trim()).toBe('feature.js');
+    // The remote holds the merge on top of both sides.
+    const tip = await remoteTip(remote, SYNC_BRANCH);
+    expect(tip).toBe(await headOf(work));
+    expect(tip).not.toBe(row.sha);
+  });
+
+  it('a conflict fails the push with branch_sync_conflict and publishes the conflict branch', async () => {
+    const { remote, work } = await setupSyncedCheckout();
+    await commitOnRemote(remote, SYNC_BRANCH, 'base.txt', 'CLI version\n');
+    await writeFile(path.join(work, 'base.txt'), 'stage version\n');
+    const res = await stageExit(work, remote);
+    expect(res.ok).toBe(false);
+    expect(res.results[0]).toMatchObject({
+      committed: true,
+      pushed: false,
+      reason: 'branch_sync_conflict',
+      conflicts: ['base.txt'],
+      conflictBranch: 'aidlc/i1--sync-conflict',
+    });
+    expect(await remoteTip(remote, 'aidlc/i1--sync-conflict')).toBe(res.results[0].sha);
+  });
+});

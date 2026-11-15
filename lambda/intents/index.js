@@ -4766,6 +4766,97 @@ const handleDeriveIntent = async ({ event, projectId, intentId, response }) => {
   }
 };
 
+// POST /projects/{projectId}/intents/{intentId}/sync-branch
+// Pick up pushes made to the intent branch (a person, the AI-DLC CLI, CI) now,
+// instead of at the next stage. Stages sync on their own before the agent
+// starts and before each push; this lets a person check for a conflict while
+// the run waits on them. Only a parked (WAITING) intent: META is WAITING only
+// for a sequential or engine gate, when no stage or lane merge uses the intent
+// session's checkout. The runtime refuses as well while a job holds the session.
+const handleSyncBranch = async ({ event, projectId, intentId, response }) => {
+  const meta = await store.getExecution(intentId, { consistentRead: true });
+  if (!meta || meta.projectId !== projectId) {
+    return response(404, { error: 'Intent not found' });
+  }
+  if (meta.status !== 'WAITING') {
+    return response(409, {
+      error: `Intent is ${meta.status}; the branch can be synced only while the run waits for a person`,
+      code: 'intent_not_parked',
+    });
+  }
+  if (!meta.branch || !(meta.repos ?? []).length) {
+    return response(409, { error: 'This intent has no repository branch', code: 'no_branch' });
+  }
+  const runtimeTarget = runtimeTargetInput(meta, AGENTCORE_RUNTIME_ARN());
+  if (!runtimeTarget.agentRuntimeArn) {
+    return response(500, { error: 'Agent runtime is not configured' });
+  }
+  const responder = getResponder(event);
+  const payload = {
+    command: 'sync-branch',
+    projectId,
+    intentId,
+    executionId: intentId,
+    repos: meta.repos,
+    branch: meta.branch,
+    baseBranch: meta.baseBranch,
+    baseBranches: meta.baseBranches,
+    gitProvider: meta.gitProvider || 'github',
+    repoProviders: meta.repoProviders ?? null,
+    ...(meta.starterName && meta.starterEmail
+      ? { gitAuthor: { name: meta.starterName, email: meta.starterEmail } }
+      : {}),
+    requestedByName: responder.displayName || null,
+  };
+  try {
+    const res = await agentcore.send(
+      new InvokeAgentRuntimeCommand({
+        ...runtimeTarget,
+        runtimeSessionId: runtimeSessionIdFor(intentId),
+        contentType: 'application/json',
+        accept: 'application/json',
+        payload: Buffer.from(
+          JSON.stringify({
+            ...payload,
+            ...(await gatewayGrantFields(payload.command, { projectId, intentId })),
+          }),
+        ),
+      }),
+    );
+    const text = res.response ? await res.response.transformToString() : '';
+    const out = text ? JSON.parse(text) : {};
+    if (out.reason === 'session_busy') {
+      return response(409, {
+        error: 'The intent session is busy; try again shortly',
+        code: 'session_busy',
+      });
+    }
+    if (out.reason === 'branch_sync_conflict') {
+      return response(409, {
+        error: out.summary ?? 'Changes pushed to the branch conflict with this intent',
+        code: 'branch_sync_conflict',
+        results: out.results ?? [],
+      });
+    }
+    if (out.ok === false) {
+      return response(422, {
+        error: out.summary ?? out.detail ?? 'Branch sync failed',
+        code: out.reason ?? 'sync_failed',
+        results: out.results ?? [],
+      });
+    }
+    return response(200, {
+      ok: true,
+      changed: out.changed === true,
+      summary: out.summary ?? null,
+      results: out.results ?? [],
+    });
+  } catch (err) {
+    logger.error('[sync-branch] runtime invoke failed', err);
+    return response(502, { error: 'Failed to invoke the agent runtime' });
+  }
+};
+
 // POST /projects/{projectId}/intents/{intentId}/delivery
 // Publication recovery is independent of stage recovery and always scoped
 // to the current run. Preview performs reads only, including old executions.
@@ -6996,7 +7087,7 @@ export const handler = async (event, context) => {
       intentId &&
       (httpMethod === 'DELETE' ||
         (httpMethod === 'POST' &&
-          (/\/(rewind|recompose|cancel|repair)$/.test(path ?? '') ||
+          (/\/(rewind|recompose|cancel|repair|sync-branch)$/.test(path ?? '') ||
             INTENT_IMPORT_PATH.test(path ?? ''))))
     ) {
       const current = await store.getExecution(intentId, { consistentRead: true });
@@ -7173,6 +7264,10 @@ export const handler = async (event, context) => {
         response,
         cleanupDeadline,
       });
+    }
+
+    if (intentId && httpMethod === 'POST' && path?.endsWith('/sync-branch')) {
+      return await handleSyncBranch({ event, projectId, intentId, response });
     }
 
     if (intentId && httpMethod === 'POST' && path?.endsWith('/derive')) {

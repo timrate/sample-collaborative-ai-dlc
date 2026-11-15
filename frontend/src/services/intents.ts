@@ -978,6 +978,25 @@ export interface DeliveryPreview {
   canRecord: boolean;
 }
 
+// One repository's outcome of a branch sync (POST .../sync-branch).
+export interface IntentBranchSyncRepo {
+  repo: string;
+  synced: 'up_to_date' | 'fast_forward' | 'merged' | 'empty' | 'no_remote_branch' | false;
+  sha: string | null;
+  conflicts?: string[];
+  // Where the session's work was published when the merge conflicted.
+  conflictBranch?: string | null;
+  reason?: string;
+  detail?: string;
+}
+
+export interface IntentBranchSyncResult {
+  ok: true;
+  changed: boolean;
+  summary: string | null;
+  results: IntentBranchSyncRepo[];
+}
+
 export interface IntentRepairResult {
   intent: Intent;
   repair: {
@@ -1430,6 +1449,10 @@ export const intentsService = {
       `/projects/${projectId}/intents/${intentId}/resume`,
       {},
     ),
+  // Pick up pushes made to a parked intent's branch now (stages also sync on
+  // their own). 409 `branch_sync_conflict` carries the conflicted repositories.
+  syncBranch: (projectId: string, intentId: string) =>
+    api.post<IntentBranchSyncResult>(`/projects/${projectId}/intents/${intentId}/sync-branch`, {}),
   answerGate: (projectId: string, intentId: string, humanTaskId: string, input: GateAnswer) =>
     api.post<IntentGate>(
       `/projects/${projectId}/intents/${intentId}/gates/${humanTaskId}/answer`,

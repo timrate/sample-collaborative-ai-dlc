@@ -87,6 +87,25 @@ All git operations are owned by the engine — agents never run git and never ho
 - The engine commits and pushes after every stage, so work is durable even if a run is cancelled. Its commit messages are Conventional Commits (see [Engine-owned git](../concepts/execution.md#engine-owned-git)).
 - On success, the pull/merge request opens from the intent branch onto the base branch.
 
+### Changes pushed to the intent branch
+
+You can push to the intent branch while an intent runs, for example a fix by hand, or work done in the AI-DLC CLI. The engine picks up those pushes:
+
+- **Between stages.** Before each stage's agent starts, the engine fetches the branch and fast-forwards to it. If the session also has unpushed commits, it merges.
+- **During a stage.** Before each push, the engine merges anything pushed while the stage ran.
+- **On request.** While the run waits for a person, select **Intent actions** (**⋯**), then **Sync branch now**. The result shows what was picked up, or that the branch was already up to date.
+
+The timeline records each sync as a **v2.git.synced** note.
+
+If your push conflicts with the intent's work, the engine doesn't resolve it:
+
+1. The stage fails with `branch_sync_conflict`. **Sync branch now** shows a conflict notice instead. The message lists the conflicted files.
+2. The engine pushes the intent's work to a branch named `<intent branch>--sync-conflict`.
+3. Merge that branch into the intent branch, resolve the conflicts, and push.
+4. Retry the stage. The engine fast-forwards to your resolution and continues.
+
+The engine force-pushes `--sync-conflict` on every conflict, so don't commit your work to that branch. Delete it once you've merged it.
+
 ## Binding a tracker to a space
 
 A tracker binding tells the platform which external project to list issues from when starting an intent. The same space can be bound to multiple trackers — for example, GitHub Issues for the platform's own bug tracker plus Jira Cloud for the team's product backlog.

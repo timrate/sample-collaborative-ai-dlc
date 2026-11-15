@@ -314,6 +314,7 @@ const deps = (store, overrides = {}) => ({
   env: { BEDROCK_MODEL: 'us.anthropic.claude-sonnet-4-6' },
   clock: () => 'T',
   commitAndPushAll: async () => ({ ok: true, committed: false, results: [] }),
+  syncAllBranches: async () => ({ ok: true, changed: false, conflicted: false, results: [] }),
   openGraph: async () => ({}),
   readArtifactHeadHashes: async () => [HEAD],
   spawnFn: () => ({

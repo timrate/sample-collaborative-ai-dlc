@@ -90,8 +90,10 @@ import {
 } from '../workspace.js';
 import {
   commitAndPushAll as defaultCommitAndPushAll,
+  describeSyncConflicts,
   freeDiskBytes,
   gitResultForCommitRefs as defaultGitResultForCommitRefs,
+  syncAllBranches as defaultSyncAllBranches,
 } from '../git-engine.js';
 import {
   consumeCommitDescription,
@@ -1206,6 +1208,11 @@ const workAtRiskFailure = (gitResult) => {
           (r.committed !== true && (r.dirty === true || r.reason === 'engine_crashed')),
       );
   if (atRiskRepos.length === 0) return null;
+  // The remote moved during the stage and the merge conflicted: a person has
+  // to resolve it before a retry can push.
+  if (atRiskRepos.some((r) => r.reason === 'branch_sync_conflict')) {
+    return { code: 'branch_sync_conflict', detail: describeSyncConflicts(atRiskRepos) };
+  }
   const detail = atRiskRepos
     .map(
       (r) =>
@@ -1871,6 +1878,9 @@ const runStageAttempt = async (
     // Engine-owned git (docs/v2-parallel.md WP2): commit + push after every CLI
     // exit. Injected for tests.
     commitAndPushAll = defaultCommitAndPushAll,
+    // Pick up pushes made to the branch since the last stage before the agent
+    // starts. Injected for tests.
+    syncAllBranches = defaultSyncAllBranches,
     // Project committed files into Neptune after all stage gates pass. The
     // adapter detects traceability capability from a valid produced artifact,
     // never from workflowVersion, and is deliberately best-effort.
@@ -2316,6 +2326,60 @@ const runStageAttempt = async (
         stageInstanceId,
         action: 'agent.workspace',
         payload: { state: 'RESTORED', repos: heal.repos },
+      });
+    }
+  }
+
+  // 2a¼. Branch sync: a warm session reuses its checkout without fetching, so
+  // pushes made to the branch since the last stage (a person, the AI-DLC CLI,
+  // CI) would otherwise be invisible to this stage and reject its push. A
+  // conflict fails the stage before the agent runs so a person can resolve it;
+  // a fetch failure is recorded and the stage continues, as it did before.
+  if (repos.length > 0 && branch) {
+    const sync = await syncAllBranches({
+      repos,
+      workspaceDir,
+      branch,
+      gitProvider,
+      repoProviders,
+      projectId,
+      executionId,
+      author: gitAuthor,
+      message: await engineCommitMessage({ kind: 'sync', stageId, unitSlug }),
+    }).catch((error) => ({
+      ok: false,
+      changed: false,
+      conflicted: false,
+      results: [{ repo: '-', synced: false, reason: 'engine_crashed', detail: error?.message }],
+    }));
+    if (sync.conflicted) {
+      const detail = describeSyncConflicts(sync.results);
+      await emitLifecycleEvent({
+        type: 'v2.git.sync_conflict',
+        summary: `Changes pushed to ${branch} conflict with this session's work: ${detail}`,
+        stageInstanceId,
+      });
+      return fail(stageInstanceId, 'branch_sync_conflict', detail);
+    }
+    if (sync.changed) {
+      const moved = sync.results
+        .filter((r) => r.synced === 'fast_forward' || r.synced === 'merged')
+        .map((r) => `${r.repo}@${String(r.sha ?? '').slice(0, 8)} (${r.synced.replace('_', '-')})`);
+      await emitLifecycleEvent({
+        type: 'v2.git.synced',
+        summary: `Picked up changes pushed to ${branch}: ${moved.join(', ')}`,
+        stageInstanceId,
+      });
+    }
+    const failed = sync.results.filter((r) => !r.synced && r.reason !== 'branch_sync_conflict');
+    if (failed.length > 0) {
+      await emitLifecycleEvent({
+        type: 'v2.git.sync_failed',
+        summary: `Could not check ${branch} for new pushes; running on the current checkout (${failed
+          .map((r) => `${r.repo}: ${r.reason ?? 'unknown'}`)
+          .join('; ')
+          .slice(0, 300)})`,
+        stageInstanceId,
       });
     }
   }
@@ -3904,6 +3968,16 @@ const runStageAttempt = async (
   // judging the stage on its pre-approval commit.
   const publishGitEvidence = async (result, { label = null } = {}) => {
     if (!result || (!result.committed && result.ok)) return;
+    const mergedRepos = (result.results ?? []).filter((r) => r.synced === 'merged');
+    if (mergedRepos.length > 0) {
+      await emitLifecycleEvent({
+        type: 'v2.git.synced',
+        summary: `Merged changes pushed to ${branch} during ${stageLabel}${label ? ` (${label})` : ''} (${mergedRepos
+          .map((r) => r.repo)
+          .join(', ')})`,
+        stageInstanceId,
+      });
+    }
     const failedRepos = (result.results ?? [])
       .filter((r) => r.pushed !== true && r.pushed !== 'empty' && r.pushed !== 'up_to_date')
       // Carry the git stderr into the event — the 2026-07 incident's ENOSPC
@@ -4027,6 +4101,7 @@ const runStageAttempt = async (
         projectId,
         executionId,
         author: gitAuthor,
+        syncMessage: await engineCommitMessage({ kind: 'sync', stageId, unitSlug }),
         ...(await stageCommitMessages({
           messageFor: engineCommitMessage,
           stageId,
@@ -4372,6 +4447,7 @@ const runStageAttempt = async (
     projectId,
     executionId,
     author: gitAuthor,
+    syncMessage: await engineCommitMessage({ kind: 'sync', stageId, unitSlug }),
     // Commit message carries the unit dimension on lane runs (docs/v2-parallel.md
     // A3): every commit is attributable to stage + lane + execution from git alone.
     ...(await stageCommitMessages({
@@ -4753,6 +4829,7 @@ const runStageAttempt = async (
           executionId,
           author: gitAuthor,
           message: await engineCommitMessage({ stageId, phase: stage.phase, unitSlug, label }),
+          syncMessage: await engineCommitMessage({ kind: 'sync', stageId, unitSlug }),
         }).catch((error) => ({
           ok: false,
           committed: false,

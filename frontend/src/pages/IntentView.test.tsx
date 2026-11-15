@@ -67,6 +67,7 @@ const start = vi.fn();
 const rewind = vi.fn();
 const answerGate = vi.fn();
 const repair = vi.fn();
+const syncBranch = vi.fn();
 const exportWorkflow = vi.fn();
 const writeText = vi.fn();
 const graph = vi.fn();
@@ -79,6 +80,7 @@ vi.mock('@/services/intents', () => ({
     rewind: (...a: unknown[]) => rewind(...a),
     answerGate: (...a: unknown[]) => answerGate(...a),
     repair: (...a: unknown[]) => repair(...a),
+    syncBranch: (...a: unknown[]) => syncBranch(...a),
     exportWorkflow: (...a: unknown[]) => exportWorkflow(...a),
     // Knowledge graph feeding the popovers/derived-items section — empty
     // graph keeps those affordances out of these page-behavior tests.
@@ -94,6 +96,7 @@ vi.mock('@/services/workflows', () => ({
 
 import IntentView from './IntentView';
 import { IntentProvider, clearIntentCache } from '@/contexts/IntentContext';
+import { ApiError } from '@/services/api';
 
 const renderAt = (initialEntry = '/space/p1/intent/i1') =>
   render(
@@ -2594,5 +2597,63 @@ describe('IntentView — imported CLI progress', () => {
     } else {
       expect(screen.queryByText('Import CLI progress')).not.toBeInTheDocument();
     }
+  });
+});
+
+describe('IntentView — Sync branch now', () => {
+  beforeEach(() => {
+    syncBranch.mockReset();
+  });
+
+  it.each([
+    ['WAITING', true],
+    ['RUNNING', false],
+    ['FAILED', false],
+    ['SUCCEEDED', false],
+  ])('offers the sync action for a %s intent: %s', async (status, offered) => {
+    get.mockResolvedValue(baseDetail({ status }));
+    renderAt();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Intent actions' }));
+    if (offered) {
+      expect(await screen.findByText('Sync branch now')).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText('Sync branch now')).not.toBeInTheDocument();
+    }
+  });
+
+  it('shows what the sync picked up', async () => {
+    get.mockResolvedValue(baseDetail({ status: 'WAITING' }));
+    syncBranch.mockResolvedValue({
+      ok: true,
+      changed: true,
+      summary: 'Synced aidlc/i1: owner/repo@aaaaaaaa (fast-forward)',
+      results: [],
+    });
+    renderAt();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Intent actions' }));
+    await userEvent.click(await screen.findByText('Sync branch now'));
+    expect(syncBranch).toHaveBeenCalledWith('p1', 'i1');
+    const notice = await screen.findByTestId('branch-sync-notice');
+    expect(notice).toHaveTextContent('Branch synced');
+    expect(notice).toHaveTextContent('owner/repo@aaaaaaaa (fast-forward)');
+  });
+
+  it('shows a conflict as a notice that tells the person what to do', async () => {
+    get.mockResolvedValue(baseDetail({ status: 'WAITING' }));
+    syncBranch.mockRejectedValue(
+      new ApiError(409, 'owner/repo: conflicts in src/app.ts', {
+        error: 'owner/repo: conflicts in src/app.ts',
+        code: 'branch_sync_conflict',
+      }),
+    );
+    renderAt();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Intent actions' }));
+    await userEvent.click(await screen.findByText('Sync branch now'));
+    const notice = await screen.findByTestId('branch-sync-notice');
+    expect(notice).toHaveTextContent('Changes on the branch conflict with this intent');
+    expect(notice).toHaveTextContent('src/app.ts');
   });
 });

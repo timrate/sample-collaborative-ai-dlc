@@ -47,6 +47,10 @@ import {
 //       intent head into a unit branch before making its draft PR ready.
 //   { "command": "refresh-intent", ...refreshIntentWorkspace args } → reset the
 //       intent session checkout to the remote after provider-side integration.
+//   { "command": "sync-branch", ...syncBranch args } → on request while the
+//       intent is parked: fetch the intent branch, fast-forward or merge with
+//       the engine identity, push a merge, report a conflict. Refused while a
+//       background job holds the session busy.
 //   { "command": "resolve-conflict", ...resolveConflict args } → WP6: the
 //       scoped conflict-resolution stage (lane session; engine merges +
 //       verifies + concludes, the agent only edits the conflicted files).
@@ -359,6 +363,7 @@ const main = async () => {
   const { initLane, mergeLane, reconcileLane, refreshIntentWorkspace } =
     await import('./commands/lane.js');
   const { resolveConflict } = await import('./commands/resolve-conflict.js');
+  const { syncBranch } = await import('./commands/sync-branch.js');
   const { inspect } = await import('./commands/inspect.js');
   const { capabilities } = await import('./commands/capabilities.js');
   const { managedRuntimeCheck } = await import('./commands/managed-runtime-check.js');
@@ -514,6 +519,12 @@ const main = async () => {
   // the session stays HealthyBusy for the job's lifetime.
   const busy = createBusyTracker();
   const stageJobs = new Map();
+  // Manual branch sync: never merges under a running background job.
+  handlers.syncBranch = (p) =>
+    syncBranch(
+      { ...p, workspaceDir },
+      { store, broadcast, isBusy: () => busy.status === 'HealthyBusy' },
+    );
   handlers.runStageStart = (p, context) =>
     createRunStageStart({
       runStage: (q) => handlers.runStage(q, context),

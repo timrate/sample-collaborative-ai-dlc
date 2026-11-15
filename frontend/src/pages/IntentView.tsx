@@ -58,6 +58,7 @@ import {
   Milestone,
   MoreHorizontal,
   Play,
+  RefreshCw,
   RotateCcw,
   Settings2,
   Trash2,
@@ -147,6 +148,11 @@ export default function IntentView() {
   const [resuming, setResuming] = useState(false);
   const [resumeNotice, setResumeNotice] = useState<{
     kind: 'expired' | 'retryable';
+    message: string;
+  } | null>(null);
+  const [syncingBranch, setSyncingBranch] = useState(false);
+  const [syncNotice, setSyncNotice] = useState<{
+    kind: 'synced' | 'conflict';
     message: string;
   } | null>(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
@@ -261,6 +267,34 @@ export default function IntentView() {
       setActionError(err instanceof Error ? err.message : 'Failed to resume intent');
     } finally {
       setResuming(false);
+    }
+  };
+
+  // Branch sync: pick up pushes made to the intent branch (a person, the
+  // AI-DLC CLI, CI) while the run waits. A conflict is a notice, not an error:
+  // the person resolves it on the branch and the next stage picks it up.
+  const handleSyncBranch = async () => {
+    if (!projectId || !intentId) return;
+    setSyncingBranch(true);
+    setActionError(null);
+    setSyncNotice(null);
+    try {
+      const result = await intentsService.syncBranch(projectId, intentId);
+      setSyncNotice({
+        kind: 'synced',
+        message:
+          result.summary ??
+          (result.changed ? 'Picked up new changes from the branch.' : 'Already up to date.'),
+      });
+    } catch (err) {
+      setDismissedError(null);
+      if (err instanceof ApiError && err.body?.code === 'branch_sync_conflict') {
+        setSyncNotice({ kind: 'conflict', message: err.message });
+        return;
+      }
+      setActionError(err instanceof Error ? err.message : 'Failed to sync the branch');
+    } finally {
+      setSyncingBranch(false);
     }
   };
 
@@ -399,6 +433,10 @@ export default function IntentView() {
   const resumeRequired = gates.some((gate) => gate.resumeAvailable === true);
   const canReshape =
     (intent.status === 'WAITING' || isFailed) && intent.constructionAutonomyMode !== 'autonomous';
+  // Branch sync runs in the intent session, so only while the run is parked on
+  // a person and the intent has a repository branch.
+  const canSyncBranch =
+    intent.status === 'WAITING' && Boolean(intent.branch) && (intent.repos?.length ?? 0) > 0;
   // Cancellable (steering): parked, stranded, or failed — never mid-RUNNING.
   const isCancellable = ['WAITING', 'CREATED', 'FAILED'].includes(intent.status);
   // Deletable (destructive): owner/admin, any status except mid-RUNNING.
@@ -597,6 +635,12 @@ export default function IntentView() {
                   Import CLI progress
                 </DropdownMenuItem>
               )}
+              {canSyncBranch && (
+                <DropdownMenuItem disabled={syncingBranch} onSelect={() => void handleSyncBranch()}>
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  {syncingBranch ? 'Syncing branch…' : 'Sync branch now'}
+                </DropdownMenuItem>
+              )}
               {(isCancellable || isDeletable) && <DropdownMenuSeparator />}
               {isCancellable && (
                 <DropdownMenuItem disabled={cancelling} onClick={handleCancel}>
@@ -779,6 +823,48 @@ export default function IntentView() {
               variant="ghost"
               className="shrink-0"
               onClick={() => setResumeNotice(null)}
+            >
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {syncNotice && (
+        <div
+          className={
+            syncNotice.kind === 'conflict'
+              ? 'rounded border border-agent-waiting/40 bg-agent-waiting/10 px-3 py-3 text-sm'
+              : 'rounded border px-3 py-3 text-sm'
+          }
+          data-testid="branch-sync-notice"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-medium">
+                {syncNotice.kind === 'conflict' ? (
+                  <TriangleAlert className="h-4 w-4 text-agent-waiting" />
+                ) : (
+                  <Check className="h-4 w-4" />
+                )}
+                {syncNotice.kind === 'conflict'
+                  ? 'Changes on the branch conflict with this intent'
+                  : 'Branch synced'}
+              </div>
+              <p className="mt-1 text-[12px] text-muted-foreground">{syncNotice.message}</p>
+              {syncNotice.kind === 'conflict' && (
+                <p className="mt-1 text-[12px] text-muted-foreground">
+                  Resolve it on the branch before the run continues. A stage that starts before then
+                  fails with a branch sync conflict; retry it once the branch is fixed.
+                </p>
+              )}
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="shrink-0"
+              onClick={() => setSyncNotice(null)}
             >
               Dismiss
             </Button>

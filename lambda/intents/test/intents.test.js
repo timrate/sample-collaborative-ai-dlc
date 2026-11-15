@@ -7003,6 +7003,135 @@ describe('POST /derive — manual graph-projection backfill', () => {
   });
 });
 
+describe('POST /sync-branch — pick up pushes made to a parked intent branch', () => {
+  const syncBranch = (claimsBag, projectId, intentId) =>
+    handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/sync-branch`,
+      pathParameters: { projectId, intentId },
+      body: null,
+      ...claimsBag,
+    });
+  const seedMeta = (projectId, intentId, extra = {}) => {
+    procStore.set(keyOf(`EXEC#${intentId}`, 'META'), {
+      pk: `EXEC#${intentId}`,
+      sk: 'META',
+      type: 'Execution',
+      executionId: intentId,
+      intentId,
+      projectId,
+      status: 'WAITING',
+      branch: 'aidlc/feature-x',
+      repos: ['acme/api'],
+      gitProvider: 'github',
+      starterName: 'Sam',
+      starterEmail: 'sam@example.com',
+      environment: MANAGED_ENVIRONMENT_SNAPSHOT,
+      ...extra,
+    });
+  };
+  const runtimeReturns = (out) =>
+    agentcoreMock.on(InvokeAgentRuntimeCommand).resolves({
+      response: { transformToString: async () => JSON.stringify(out) },
+    });
+
+  beforeEach(() => {
+    vi.stubEnv('AGENTCORE_RUNTIME_ARN', 'arn:aws:bedrock-agentcore:eu:1:runtime/x');
+  });
+
+  it('refuses a non-member and never invokes the runtime', async () => {
+    const owner = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(owner);
+    seedMeta(projectId, 'i-deny');
+    const res = await syncBranch(claims(`u-${randomUUID()}`), projectId, 'i-deny');
+    expect(res.statusCode).toBe(403);
+    expect(agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)).toHaveLength(0);
+  });
+
+  it('refuses unless the run is parked, and 404s a project mismatch', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedMeta(projectId, 'i-running', { status: 'RUNNING' });
+    const running = await syncBranch(claims(sub), projectId, 'i-running');
+    expect(running.statusCode).toBe(409);
+    expect(JSON.parse(running.body).code).toBe('intent_not_parked');
+    seedMeta(projectId, 'i-norepo', { repos: [] });
+    expect(JSON.parse((await syncBranch(claims(sub), projectId, 'i-norepo')).body).code).toBe(
+      'no_branch',
+    );
+    seedMeta('another-project', 'i-other');
+    expect((await syncBranch(claims(sub), projectId, 'i-other')).statusCode).toBe(404);
+    expect(agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)).toHaveLength(0);
+  });
+
+  it('dispatches sync-branch to the intent session with the META branch and repos', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedMeta(projectId, 'i-sync');
+    runtimeReturns({
+      ok: true,
+      changed: true,
+      summary: 'Synced aidlc/feature-x: acme/api@aaaaaaaa (fast-forward)',
+      results: [{ repo: 'acme/api', synced: 'fast_forward', sha: 'a'.repeat(40) }],
+    });
+    const res = await syncBranch(claims(sub), projectId, 'i-sync');
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ok: true, changed: true });
+    const call = agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)[0].args[0].input;
+    expect(call.runtimeSessionId.startsWith('aidlc-intent-i-sync')).toBe(true);
+    const payload = JSON.parse(Buffer.from(call.payload).toString('utf8'));
+    expect(payload).toMatchObject({
+      command: 'sync-branch',
+      projectId,
+      intentId: 'i-sync',
+      executionId: 'i-sync',
+      repos: ['acme/api'],
+      branch: 'aidlc/feature-x',
+      gitProvider: 'github',
+      gitAuthor: { name: 'Sam', email: 'sam@example.com' },
+    });
+    await expect(verifiedGatewayGrant(payload.gatewayGrant)).resolves.toMatchObject({
+      mode: 'execution',
+      executionId: 'i-sync',
+    });
+  });
+
+  it('maps a conflict to 409 branch_sync_conflict with the repositories', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedMeta(projectId, 'i-conflict');
+    runtimeReturns({
+      ok: false,
+      conflicted: true,
+      reason: 'branch_sync_conflict',
+      summary: 'Changes pushed to aidlc/feature-x conflict with this session',
+      results: [
+        {
+          repo: 'acme/api',
+          synced: false,
+          conflicts: ['src/app.ts'],
+          conflictBranch: 'aidlc/feature-x--sync-conflict',
+        },
+      ],
+    });
+    const res = await syncBranch(claims(sub), projectId, 'i-conflict');
+    expect(res.statusCode).toBe(409);
+    const body = JSON.parse(res.body);
+    expect(body.code).toBe('branch_sync_conflict');
+    expect(body.results[0].conflictBranch).toBe('aidlc/feature-x--sync-conflict');
+  });
+
+  it('maps a busy session to 409 session_busy', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedMeta(projectId, 'i-busy');
+    runtimeReturns({ ok: false, reason: 'session_busy' });
+    const res = await syncBranch(claims(sub), projectId, 'i-busy');
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBe('session_busy');
+  });
+});
+
 describe('POST /rewind', () => {
   // Two-stage plan for the pinned workflow (version 4, scope 'feature'):
   // design → implement, both led by the reserved 'orchestrator' ref so no AGENT
