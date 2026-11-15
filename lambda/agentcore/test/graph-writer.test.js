@@ -204,7 +204,20 @@ describe('createArtifact', () => {
       editedBy: 'alice',
       origin: 'quorum',
     });
-    expect((await writer.getArtifact({ id: 'epoch' })).collaboration_epoch).not.toBe(regenerated);
+    const replaced = (await writer.getArtifact({ id: 'epoch' })).collaboration_epoch;
+    expect(replaced).not.toBe(regenerated);
+    await applyArtifactEdit({
+      g,
+      intentId: SCOPE.intentId,
+      artifactId: 'epoch',
+      content: 'imported from the CLI',
+      editedBy: 'alice',
+      origin: 'cli-import',
+      editRef: 'import-1',
+    });
+    const imported = await writer.getArtifact({ id: 'epoch' });
+    expect(imported.collaboration_epoch).not.toBe(replaced);
+    expect(imported).toMatchObject({ edit_origin: 'cli-import', edit_ref: 'import-1' });
   });
   it('stamps the stage that last changed the content, which the agent cannot set', async () => {
     await seedIntent();

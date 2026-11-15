@@ -92,7 +92,7 @@ describe('collectDownstreamClosure', () => {
 });
 
 describe('edit origins', () => {
-  it('only human and quorum are valid post-hoc edit origins', () => {
-    expect(EDIT_ORIGINS).toEqual(['human', 'quorum']);
+  it('only human, quorum and cli-import are valid post-hoc edit origins', () => {
+    expect(EDIT_ORIGINS).toEqual(['human', 'quorum', 'cli-import']);
   });
 });

@@ -2536,3 +2536,63 @@ describe('terminal completion diagnostics without terminal recovery', () => {
     },
   );
 });
+
+describe('IntentView — imported CLI progress', () => {
+  const continuation = {
+    importId: 'import-1',
+    stageId: 'workflow-planning',
+    importedAt: '2026-08-15T09:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    clearIntentCache();
+    get.mockReset();
+    rewind.mockReset();
+    graph.mockReset().mockResolvedValue({ nodes: [], edges: [] });
+    compiled.mockReset().mockResolvedValue({ graph: { nodes: [], edges: [] } });
+    workflowGet.mockReset().mockResolvedValue({ phases: [] });
+  });
+
+  it('offers Continue instead of a failure for an imported intent', async () => {
+    get.mockResolvedValue(
+      baseDetail({
+        status: 'FAILED',
+        failureReason: 'imported_from_cli',
+        importedContinuation: continuation,
+      }),
+    );
+    rewind.mockResolvedValue({});
+    renderAt();
+
+    expect(await screen.findByText('CLI progress imported')).toBeInTheDocument();
+    expect(screen.queryByText('Run failed')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Continue at Workflow Planning' }));
+    expect(rewind).toHaveBeenCalledWith('p1', 'i1', { fromStageId: 'workflow-planning' });
+  });
+
+  it('keeps the failure banner for an ordinary failed run', async () => {
+    get.mockResolvedValue(baseDetail({ status: 'FAILED', failureReason: 'boom' }));
+    renderAt();
+
+    expect(await screen.findByText('Run failed')).toBeInTheDocument();
+    expect(screen.queryByText('CLI progress imported')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['WAITING', true],
+    ['FAILED', true],
+    ['CANCELLED', true],
+    ['RUNNING', false],
+    ['SUCCEEDED', false],
+  ])('offers the import action for a %s intent: %s', async (status, offered) => {
+    get.mockResolvedValue(baseDetail({ status }));
+    renderAt();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Intent actions' }));
+    if (offered) {
+      expect(await screen.findByText('Import CLI progress')).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText('Import CLI progress')).not.toBeInTheDocument();
+    }
+  });
+});

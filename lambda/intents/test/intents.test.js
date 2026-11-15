@@ -4,7 +4,7 @@ import { createProcessStore } from '../../shared/v2-process-store.js';
 import { serializePriceTable } from '../../shared/model-pricing.js';
 import { unitPlanIdentity } from '../../shared/unit-completion.js';
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from 'vitest';
-import { generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import gremlin from 'gremlin';
 import { PartitionStrategy } from 'gremlin/lib/process/traversal-strategy.js';
@@ -41,8 +41,11 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectVersionsCommand,
+  PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { buildDistributionArchive } from '../../shared/distribution-archive.js';
+import { readImportBundle } from '../native-import.js';
 import { KMSClient, SignCommand } from '@aws-sdk/client-kms';
 import { verifyGatewayGrant } from '../../shared/gateway-grant.js';
 // Used to compute the deterministic stage-instance ids the rewind flow resets/supersedes.
@@ -88,10 +91,11 @@ vi.mock('../../shared/v2-workflow-plan.js', async (importOriginal) => {
   planSpy.loadExecutionPlan.mockImplementation(actual.loadExecutionPlan);
   return { ...actual, loadExecutionPlan: planSpy.loadExecutionPlan };
 });
-vi.mock('../native-export.js', () => ({
+// Only the archive builder is replaced; distribution loading and alignment
+// stay real so the CLI import round trip below re-projects like an export.
+vi.mock('../native-export.js', async (importOriginal) => ({
+  ...(await importOriginal()),
   createNativeExport: createNativeExportSpy,
-  EXPORT_SOURCE_UNAVAILABLE: 'export_source_unavailable',
-  EXPORT_MISCONFIGURED: 'export_misconfigured',
 }));
 
 const PARTITION = `t-${randomUUID()}`;
@@ -2252,6 +2256,420 @@ describe('POST /projects/{id}/intents/{intentId}/export', () => {
       code: 'export_checkpoint_unavailable',
     });
     expect(createNativeExportSpy).not.toHaveBeenCalled();
+  });
+});
+
+// Export → CLI progress → import → export, through the real handlers,
+// projector, importer, ZIP and graph. Only S3 transport and presigning are
+// faked.
+describe('POST /projects/{id}/intents/{intentId}/import (CLI re-attach)', () => {
+  const ref = 'b'.repeat(40);
+  const ns = 'aidlc-v2@4';
+  const si = (stageId) => planStageInstanceId(ns, stageId);
+  const UPLOAD_ID = '0b7a2f4e-2c1d-4e8f-9a6b-3d5c7e9f1a2b';
+
+  const seedTwoStagePlan = () => {
+    procStore.set(keyOf('WF#default#aidlc-v2', 'V#4#META'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'V#4#META',
+      sourceRef: ref,
+    });
+    ['requirements-analysis', 'workflow-planning'].forEach((stageId, index) => {
+      procStore.set(keyOf('WF#default#aidlc-v2', `V#4#PLACEMENT#${stageId}`), {
+        pk: 'WF#default#aidlc-v2',
+        sk: `V#4#PLACEMENT#${stageId}`,
+        stageId,
+        order: index + 1,
+        scopeMembership: { feature: 'EXECUTE' },
+      });
+      procStore.set(keyOf(`BLOCK#${stageId}`, 'META'), {
+        pk: `BLOCK#${stageId}`,
+        sk: 'META',
+        GSI1PK: 'TENANT#default#STAGE',
+        GSI1SK: `NAME#${stageId}`,
+        id: stageId,
+        blockId: stageId,
+        type: 'STAGE',
+        version: 1,
+        phase: 'inception',
+        mode: 'inline',
+        leadAgent: 'orchestrator',
+        produces: [],
+        consumes: [],
+        sensors: [],
+        humanValidation: 'none',
+        sourceRef: ref,
+      });
+    });
+  };
+
+  // A cached codex distribution whose stage graph matches the plan above.
+  const seedDistribution = async () => {
+    const stageFile = (slug, number) =>
+      Buffer.from(
+        `---\nslug: ${slug}\nnumber: "${number}"\nphase: inception\nlead_agent: orchestrator\nproduces: []\nscopes:\n  - feature\n---\n\n# ${slug}\n`,
+      );
+    const files = new Map([
+      ['aidlc/active-space', Buffer.from('default\n')],
+      [
+        '.codex/aidlc-common/stages/inception/requirements-analysis.md',
+        stageFile('requirements-analysis', '2.2'),
+      ],
+      [
+        '.codex/aidlc-common/stages/inception/workflow-planning.md',
+        stageFile('workflow-planning', '2.3'),
+      ],
+      ['.codex/scopes/aidlc-feature.md', Buffer.from('---\nname: feature\n---\n\n# feature\n')],
+      [
+        '.codex/tools/data/harness.json',
+        Buffer.from(JSON.stringify({ harnessDir: '.codex', rulesSubdir: 'aidlc-rules' })),
+      ],
+      [
+        '.codex/tools/data/scope-grid.json',
+        Buffer.from(
+          `${JSON.stringify({ feature: { stages: { 'requirements-analysis': 'EXECUTE', 'workflow-planning': 'EXECUTE' } } }, null, 2)}\n`,
+        ),
+      ],
+      [
+        '.codex/tools/data/stage-graph.json',
+        Buffer.from(
+          `${JSON.stringify(
+            [
+              {
+                slug: 'requirements-analysis',
+                number: '2.2',
+                phase: 'inception',
+                lead_agent: 'orchestrator',
+                produces: [],
+                scopes: ['feature'],
+              },
+              {
+                slug: 'workflow-planning',
+                number: '2.3',
+                phase: 'inception',
+                lead_agent: 'orchestrator',
+                produces: [],
+                scopes: ['feature'],
+              },
+            ],
+            null,
+            2,
+          )}\n`,
+        ),
+      ],
+    ]);
+    const archive = await buildDistributionArchive(files);
+    const sha = (body) => createHash('sha256').update(body).digest('hex');
+    const manifest = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 1,
+        ref,
+        harness: 'codex',
+        workspaceLayout: 'spaces',
+        archive: 'codex.tar.gz',
+        archiveBytes: archive.length,
+        archiveSha256: sha(archive),
+        files: [...files].map(([path, body]) => ({ path, bytes: body.length, sha256: sha(body) })),
+      }),
+    );
+    return { archive, manifest };
+  };
+
+  const setup = async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedTwoStagePlan();
+    const configuredRef = process.env.AIDLC_REPO_REF;
+    process.env.AIDLC_REPO_REF = ref;
+    let intent;
+    try {
+      intent = JSON.parse((await createIntent(sub, projectId)).body);
+    } finally {
+      if (configuredRef === undefined) delete process.env.AIDLC_REPO_REF;
+      else process.env.AIDLC_REPO_REF = configuredRef;
+    }
+    const intentId = intent.id;
+    setStatus(intentId, {
+      status: 'WAITING',
+      title: 'Payments',
+      startedAt: '2026-08-14T10:00:00.000Z',
+      aidlcRepoRef: ref,
+      orchestratorRunId: 'run-1',
+    });
+    procStore.set(keyOf(`EXEC#${intentId}`, `STAGE#${si('requirements-analysis')}`), {
+      pk: `EXEC#${intentId}`,
+      sk: `STAGE#${si('requirements-analysis')}`,
+      type: 'Stage',
+      executionId: intentId,
+      stageInstanceId: si('requirements-analysis'),
+      stageId: 'requirements-analysis',
+      phase: 'inception',
+      state: 'WAITING_FOR_HUMAN',
+      aidlcRepoRef: ref,
+      attempt: 1,
+      startedAt: '2026-08-14T10:01:00.000Z',
+    });
+    procStore.set(keyOf(`EXEC#${intentId}`, 'HUMAN#q-req'), {
+      pk: `EXEC#${intentId}`,
+      sk: 'HUMAN#q-req',
+      type: 'HumanTask',
+      executionId: intentId,
+      humanTaskId: 'q-req',
+      stageInstanceId: si('requirements-analysis'),
+      kind: 'question',
+      status: 'pending',
+      callbackId: 'cb-q-req',
+      createdAt: '2026-08-14T10:05:00.000Z',
+      questions: JSON.stringify([
+        {
+          text: 'Which interface?',
+          type: 'single',
+          options: [{ label: 'REST' }, { label: 'Events' }],
+        },
+      ]),
+    });
+    await seedIntentAnchor(intentId);
+    await g
+      .addV('Artifact')
+      .property('id', 'requirements')
+      .property('intent_id', intentId)
+      .property('artifact_type', 'requirements')
+      .property('title', 'Requirements')
+      .property('content', '# Requirements\n\nDraft.\n')
+      .property('created_at', '2026-08-14T10:02:00.000Z')
+      .property('created_by_stage_instance_id', si('requirements-analysis'))
+      .as('a')
+      .V()
+      .has('Intent', 'id', intentId)
+      .addE('CONTAINS')
+      .to('a')
+      .next();
+
+    const { archive, manifest } = await seedDistribution();
+    const uploads = new Map();
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (input.Key === `aidlc-distributions/${ref}/codex.manifest.json`) return { Body: manifest };
+      if (input.Key === `aidlc-distributions/${ref}/codex.tar.gz`) return { Body: archive };
+      if (uploads.has(input.Key)) {
+        const body = uploads.get(input.Key);
+        return {
+          Body: body,
+          ContentLength: body.length,
+          LastModified: new Date('2026-08-15T09:00:00.000Z'),
+        };
+      }
+      throw Object.assign(new Error('missing'), { name: 'NoSuchKey' });
+    });
+    s3Mock.on(PutObjectCommand).resolves({});
+    const { createNativeExport: realExport } = await vi.importActual('../native-export.js');
+    createNativeExportSpy.mockImplementation((args) =>
+      realExport({ ...args, presign: async () => 'https://example.test/export.zip' }),
+    );
+    return { sub, projectId, intentId, uploads };
+  };
+
+  const call = (sub, projectId, intentId, suffix, body) =>
+    handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/${suffix}`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify(body),
+      ...claims(sub),
+    });
+
+  // Run the export handler and return the workspace record from its ZIP.
+  const exportFiles = async (sub, projectId, intentId) => {
+    const before = s3Mock.commandCalls(PutObjectCommand).length;
+    const res = await call(sub, projectId, intentId, 'export', { harness: 'codex' });
+    expect(res.statusCode, res.body).toBe(201);
+    const put = s3Mock
+      .commandCalls(PutObjectCommand)
+      .slice(before)
+      .find((c) => c.args[0].input.Key.startsWith(`workflow-exports/${intentId}/`));
+    return readImportBundle(put.args[0].input.Body);
+  };
+
+  // What a CLI user does next: answer the question, finish Requirements
+  // Analysis, and move on to Workflow Planning.
+  const advanceInCli = (files) => {
+    const cli = new Map(files);
+    const path = (suffix) => [...cli.keys()].find((key) => key.endsWith(suffix));
+    const state = path('/aidlc-state.md');
+    cli.set(
+      state,
+      cli
+        .get(state)
+        .replace('- [?] requirements-analysis', '- [x] requirements-analysis')
+        .replace('- [ ] workflow-planning', '- [-] workflow-planning'),
+    );
+    const questions = path('/requirements-analysis-questions.md');
+    cli.set(questions, cli.get(questions).replace('[Answer]:', '[Answer]: B. Events'));
+    const requirements = path('/requirements-analysis/requirements.md');
+    cli.set(requirements, '# Requirements\n\nEvents only, decided in the CLI.\n');
+    return cli;
+  };
+
+  const upload = (uploads, intentId, files) =>
+    uploads.set(
+      `workflow-imports/${intentId}/${UPLOAD_ID}`,
+      Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          files: [...files].map(([path, content]) => ({ path, content })),
+        }),
+      ),
+    );
+
+  const stageProgress = (state) =>
+    state.slice(state.indexOf('## Stage Progress'), state.indexOf('## Current Status'));
+
+  it('previews, applies and re-exports CLI progress byte-for-byte', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    const exported = await exportFiles(sub, projectId, intentId);
+    const cli = advanceInCli(exported);
+    upload(uploads, intentId, cli);
+
+    const preview = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(preview.statusCode, preview.body).toBe(200);
+    const previewBody = JSON.parse(preview.body);
+    expect(previewBody).toMatchObject({
+      dryRun: true,
+      continuationStageId: 'workflow-planning',
+      stageCompletions: [expect.objectContaining({ stageId: 'requirements-analysis' })],
+      artifactWrites: [expect.objectContaining({ artifactType: 'requirements', change: 'update' })],
+      answeredGates: [{ humanTaskId: 'q-req', stageId: 'requirements-analysis' }],
+    });
+    // A preview writes nothing.
+    expect(procStore.get(keyOf(`EXEC#${intentId}`, 'META')).status).toBe('WAITING');
+
+    const stale = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      planToken: 'nope',
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(JSON.parse(stale.body).code).toBe('import_plan_changed');
+
+    const applied = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      planToken: previewBody.planToken,
+    });
+    expect(applied.statusCode, applied.body).toBe(201);
+
+    const meta = procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+    expect(meta).toMatchObject({
+      status: 'FAILED',
+      failureReason: 'imported_from_cli',
+      importedContinuation: expect.objectContaining({ stageId: 'workflow-planning' }),
+    });
+    expect(meta.orchestratorRunId).not.toBe('run-1');
+    expect(
+      procStore.get(keyOf(`EXEC#${intentId}`, `STAGE#${si('requirements-analysis')}`)),
+    ).toMatchObject({
+      state: 'SUCCEEDED',
+      aidlcRepoRef: ref,
+    });
+    expect(procStore.get(keyOf(`EXEC#${intentId}`, 'HUMAN#q-req'))).toMatchObject({
+      status: 'answered',
+      answer: { answers: [{ selectedOptions: [1], freeText: '' }] },
+    });
+    // The parked run's callback is released so it exits instead of hanging.
+    expect(
+      lambdaMock
+        .commandCalls(SendDurableExecutionCallbackSuccessCommand)
+        .map((c) => c.args[0].input.CallbackId),
+    ).toContain('cb-q-req');
+    const artifact = await g
+      .V()
+      .has('Artifact', 'id', 'requirements')
+      .has('intent_id', intentId)
+      .valueMap()
+      .next();
+    expect(artifact.value.get('content')[0]).toBe(
+      '# Requirements\n\nEvents only, decided in the CLI.\n',
+    );
+    expect(artifact.value.get('edit_origin')[0]).toBe('cli-import');
+
+    const again = await exportFiles(sub, projectId, intentId);
+    for (const suffix of [
+      '/requirements-analysis/requirements.md',
+      '/requirements-analysis-questions.md',
+    ]) {
+      const path = [...cli.keys()].find((key) => key.endsWith(suffix));
+      expect(again.get(path), path).toBe(cli.get(path));
+    }
+    const statePath = [...cli.keys()].find((key) => key.endsWith('/aidlc-state.md'));
+    expect(stageProgress(again.get(statePath))).toBe(stageProgress(cli.get(statePath)));
+  });
+
+  it('refuses to apply the same CLI workspace twice', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    upload(uploads, intentId, advanceInCli(await exportFiles(sub, projectId, intentId)));
+    const preview = JSON.parse(
+      (await call(sub, projectId, intentId, 'import', { uploadId: UPLOAD_ID, dryRun: true })).body,
+    );
+    await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      planToken: preview.planToken,
+    });
+
+    const second = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(second.statusCode).toBe(409);
+    expect(JSON.parse(second.body).code).toBe('import_reattach_conflict');
+  });
+
+  it('refuses a running intent and an upload for another intent', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    upload(uploads, intentId, advanceInCli(await exportFiles(sub, projectId, intentId)));
+    setStatus(intentId, { status: 'RUNNING' });
+    const busy = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(busy.statusCode).toBe(409);
+    expect(JSON.parse(busy.body).code).toBe('import_intent_busy');
+
+    setStatus(intentId, { status: 'WAITING' });
+    const other = await setup();
+    const foreign = await call(other.sub, other.projectId, other.intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(foreign.statusCode).toBe(404);
+    expect(JSON.parse(foreign.body).code).toBe('import_upload_missing');
+  });
+
+  it('denies a user who is not a member of the project', async () => {
+    const { projectId, intentId } = await setup();
+    const res = await call(`u-${randomUUID()}`, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(res.statusCode).toBe(403);
+    expect(procStore.get(keyOf(`EXEC#${intentId}`, 'META')).status).toBe('WAITING');
+  });
+
+  it('clears the continuation marker when the intent is continued by rewind', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    upload(uploads, intentId, advanceInCli(await exportFiles(sub, projectId, intentId)));
+    const preview = JSON.parse(
+      (await call(sub, projectId, intentId, 'import', { uploadId: UPLOAD_ID, dryRun: true })).body,
+    );
+    await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      planToken: preview.planToken,
+    });
+
+    const res = await call(sub, projectId, intentId, 'rewind', {
+      fromStageId: 'workflow-planning',
+    });
+    expect(res.statusCode, res.body).toBe(202);
+    expect(procStore.get(keyOf(`EXEC#${intentId}`, 'META')).importedContinuation).toBeUndefined();
   });
 });
 
@@ -6299,6 +6717,29 @@ describe('DELETE /projects/{id}/intents/{intentId}', () => {
     );
     expect(exportDelete).toBeDefined();
     expect(exportDelete.Delete.Objects).toEqual(exportVersions);
+  });
+
+  it('purges every version of the intent native workspace import uploads from S3', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intentId = JSON.parse((await createIntent(sub, projectId)).body).id;
+    await seedIntentAnchor(intentId);
+    setStatus(intentId, { status: 'SUCCEEDED' });
+
+    const importPrefix = `workflow-imports/${intentId}/`;
+    const importVersions = [{ Key: `${importPrefix}u1`, VersionId: 'v1' }];
+    s3Mock
+      .on(ListObjectVersionsCommand)
+      .callsFake((input) => (input.Prefix === importPrefix ? { Versions: importVersions } : {}));
+    s3Mock.on(DeleteObjectsCommand).resolves({});
+
+    expect((await del(sub, projectId, intentId)).statusCode).toBe(204);
+
+    const deletes = s3Mock.commandCalls(DeleteObjectsCommand).map((call) => call.args[0].input);
+    expect(
+      deletes.find((input) => input.Delete.Objects.some((o) => o.Key.startsWith(importPrefix)))
+        ?.Delete.Objects,
+    ).toEqual(importVersions);
   });
 
   it('cascade sweeps the derived layer AND spares a sibling intent that shares an artifact id', async () => {

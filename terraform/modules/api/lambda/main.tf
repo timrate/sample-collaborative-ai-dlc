@@ -705,7 +705,8 @@ resource "aws_iam_role_policy" "neptune_artifacts" {
         }
       },
       # The intent cascade (reused by project deletion) also purges each child
-      # intent's native workspace export archives, all versions.
+      # intent's native workspace export archives and import uploads, all
+      # versions.
       {
         Effect = "Allow"
         Action = [
@@ -713,14 +714,18 @@ resource "aws_iam_role_policy" "neptune_artifacts" {
           "s3:DeleteObject",
           "s3:DeleteObjectVersion",
         ]
-        Resource = ["${var.artifacts_bucket_arn}/workflow-exports/*", "${var.artifacts_bucket_arn}/yjs-documents/*"]
+        Resource = [
+          "${var.artifacts_bucket_arn}/workflow-exports/*",
+          "${var.artifacts_bucket_arn}/workflow-imports/*",
+          "${var.artifacts_bucket_arn}/yjs-documents/*",
+        ]
       },
       {
         Effect   = "Allow"
         Action   = ["s3:ListBucketVersions"]
         Resource = [var.artifacts_bucket_arn]
         Condition = {
-          StringLike = { "s3:prefix" = ["workflow-exports/*", "yjs-documents/*"] }
+          StringLike = { "s3:prefix" = ["workflow-exports/*", "workflow-imports/*", "yjs-documents/*"] }
         }
       },
       # Project-tier MCP secrets: the projects lambda lists (set-state only),
@@ -3070,7 +3075,9 @@ resource "aws_iam_role_policy" "intents" {
       },
       {
         # Native workspace export archives: written on export, and purged (all
-        # versions) when the owning intent is deleted.
+        # versions) when the owning intent is deleted. Import uploads
+        # (workflow-imports/) are presigned for the browser, read on import,
+        # and purged the same way.
         Effect = "Allow"
         Action = [
           "s3:PutObject",
@@ -3078,7 +3085,11 @@ resource "aws_iam_role_policy" "intents" {
           "s3:DeleteObject",
           "s3:DeleteObjectVersion",
         ]
-        Resource = ["${var.artifacts_bucket_arn}/workflow-exports/*", "${var.artifacts_bucket_arn}/yjs-documents/*"]
+        Resource = [
+          "${var.artifacts_bucket_arn}/workflow-exports/*",
+          "${var.artifacts_bucket_arn}/workflow-imports/*",
+          "${var.artifacts_bucket_arn}/yjs-documents/*",
+        ]
       },
       {
         # Project-uploaded Markdown rules are copied into the selected native

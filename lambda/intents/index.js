@@ -156,10 +156,20 @@ import { fetchKnowledgeGraph } from './knowledge-graph.js';
 import { buildIntentAudit } from './audit.js';
 import { buildArtifactImpact, editBlockReason, activeQuorumEdit } from './impact.js';
 import {
+  alignProjectionToDistribution,
   createNativeExport,
   EXPORT_MISCONFIGURED,
   EXPORT_SOURCE_UNAVAILABLE,
+  loadDistribution,
 } from './native-export.js';
+import {
+  createImportUpload,
+  importPreview,
+  loadImportUpload,
+  writeImportedRecords,
+} from './native-import.js';
+import { planReattach, readExportManifest } from '../shared/native-workspace-importer.js';
+import { createGraphWriter } from '../shared/mcp/graph-writer.js';
 import {
   ATTACHMENT_UPLOAD_TTL_SECONDS,
   activePendingAttachments,
@@ -1463,6 +1473,9 @@ const mapIntent = (meta) => ({
   // Set only while a recorded gate answer still needs its durable callback
   // completed — the frontend renders the Resume run action off this.
   resumeRequired: meta.resumeRequired ?? null,
+  // Set after a CLI re-attach import until the intent is continued (rewound)
+  // at `stageId`; the frontend renders the Continue action off this.
+  importedContinuation: meta.importedContinuation ?? null,
   agentCli: meta.agentCli ?? null,
   credentialSource: meta.credentialBinding?.source ?? null,
   credentialConnection:
@@ -2038,6 +2051,53 @@ const handleUnitReviewFeedback = async ({
   return response(405, { error: 'Method not allowed' });
 };
 
+// The projector input for an intent's records. Shared by export and by
+// re-attach import, which re-projects the intent to detect UI-side changes
+// since the export, so the two must build it identically.
+const buildNativeProjection = ({
+  intentId,
+  projectId,
+  stages,
+  records,
+  artifacts,
+  customRules,
+}) => {
+  const meta = records.meta;
+  const stagesByInstance = new Map(
+    (records.stages ?? []).map((stage) => [stage.stageInstanceId, stage]),
+  );
+  return {
+    intent: {
+      intentId,
+      projectId,
+      title: meta.title,
+      prompt: meta.prompt,
+      scope: meta.scope,
+      workflowId: meta.workflowId,
+      workflowVersion: meta.workflowVersion,
+      createdAt: meta.startedAt,
+      branch: meta.branch,
+      projectType: meta.projectType,
+      customRules,
+    },
+    stages,
+    stageRows: records.stages ?? [],
+    artifacts: artifacts.map((artifact) => {
+      const producer = stagesByInstance.get(artifact.createdByStageInstanceId);
+      return {
+        ...artifact,
+        stageId: producer?.stageId ?? null,
+        phase: producer?.phase ?? null,
+        repository: artifact.repository ?? producer?.repository ?? null,
+      };
+    }),
+    humanTasks: records.humanTasks ?? [],
+    repositories: exportRepositories(meta),
+    unitPlan: records.unitPlan,
+    unitRows: records.units ?? [],
+  };
+};
+
 // POST /projects/{projectId}/intents/{intentId}/export — materialize a
 // native AI-DLC workspace snapshot and return a short-lived S3 download.
 // RUNNING executions export their latest completed immutable checkpoint.
@@ -2117,42 +2177,15 @@ const handleExportIntent = async ({ event, body, projectId, intentId, g, respons
           bucket: ARTIFACTS_BUCKET(),
           rules: meta.customRules ?? [],
         });
-    const buildProjection = (projectionRecords, projectionArtifacts, projectionRules) => {
-      const projectionMeta = projectionRecords.meta;
-      const projectionStagesByInstance = new Map(
-        (projectionRecords.stages ?? []).map((stage) => [stage.stageInstanceId, stage]),
-      );
-      return {
-        intent: {
-          intentId,
-          projectId,
-          title: projectionMeta.title,
-          prompt: projectionMeta.prompt,
-          scope: projectionMeta.scope,
-          workflowId: projectionMeta.workflowId,
-          workflowVersion: projectionMeta.workflowVersion,
-          createdAt: projectionMeta.startedAt,
-          branch: projectionMeta.branch,
-          projectType: projectionMeta.projectType,
-          customRules: projectionRules,
-        },
+    const buildProjection = (projectionRecords, projectionArtifacts, projectionRules) =>
+      buildNativeProjection({
+        intentId,
+        projectId,
         stages,
-        stageRows: projectionRecords.stages ?? [],
-        artifacts: projectionArtifacts.map((artifact) => {
-          const producer = projectionStagesByInstance.get(artifact.createdByStageInstanceId);
-          return {
-            ...artifact,
-            stageId: producer?.stageId ?? null,
-            phase: producer?.phase ?? null,
-            repository: artifact.repository ?? producer?.repository ?? null,
-          };
-        }),
-        humanTasks: projectionRecords.humanTasks ?? [],
-        repositories: exportRepositories(projectionMeta),
-        unitPlan: projectionRecords.unitPlan,
-        unitRows: projectionRecords.units ?? [],
-      };
-    };
+        records: projectionRecords,
+        artifacts: projectionArtifacts,
+        customRules: projectionRules,
+      });
     const projection = buildProjection(records, artifactRows, customRules);
     const initialSnapshotToken = checkpoint ? null : exportSnapshotToken(projection);
     const legacyRefWarning = meta.aidlcRepoRef
@@ -2264,6 +2297,256 @@ const handleExportIntent = async ({ event, body, projectId, intentId, g, respons
     return response(500, {
       error: 'The native workspace export failed unexpectedly',
       detail: error.message,
+    });
+  }
+};
+
+// Re-attach import (docs/using-the-platform: "Import CLI progress"). Only an
+// intent that is not running can take CLI progress; a SUCCEEDED intent has
+// nothing left to continue.
+const NATIVE_IMPORT_STATUSES = new Set(['WAITING', 'FAILED', 'CANCELLED']);
+// Anchored on the intent segment: `/intents/{id}/attachments/import` is a
+// different route.
+const INTENT_IMPORT_PATH = /\/intents\/[^/]+\/import$/;
+const INTENT_IMPORT_UPLOAD_PATH = /\/intents\/[^/]+\/import\/upload$/;
+const NATIVE_IMPORT_ERROR_STATUS = {
+  import_upload_invalid: 400,
+  import_bundle_invalid: 400,
+  import_unsafe_path: 400,
+  import_manifest_invalid: 400,
+  import_upload_missing: 404,
+  import_bundle_too_large: 413,
+};
+
+const importErrorResponse = (error, response) => {
+  if (typeof error?.code === 'string' && error.code.startsWith('import_')) {
+    return response(NATIVE_IMPORT_ERROR_STATUS[error.code] ?? 409, {
+      error: error.message.replace(/^native-import: /, ''),
+      code: error.code,
+    });
+  }
+  // The pinned harness could not be aligned with the intent's plan; the same
+  // workspace could not have been exported, so it cannot be re-attached.
+  if (String(error?.message ?? '').startsWith('native-export:')) {
+    return response(409, {
+      error: 'This intent cannot be re-projected for import',
+      detail: error.message,
+      code: 'import_projection_failed',
+    });
+  }
+  return null;
+};
+
+const importableIntent = async (event, projectId, intentId, response) => {
+  const meta = await store.getExecution(intentId, { consistentRead: true });
+  if (!meta || meta.projectId !== projectId)
+    return { res: response(404, { error: 'Intent not found' }) };
+  const denied = validationIntentDenied(event, meta, response);
+  if (denied) return { res: denied };
+  if (!NATIVE_IMPORT_STATUSES.has(meta.status)) {
+    return {
+      res: response(409, {
+        error: `Intent is ${meta.status}; CLI progress can be imported only while it is parked, failed or cancelled`,
+        code: 'import_intent_busy',
+      }),
+    };
+  }
+  return { meta };
+};
+
+// POST /projects/{projectId}/intents/{intentId}/import/upload — presign the
+// browser upload of an export ZIP or a branch file bundle.
+const handleImportUpload = async ({ event, body, projectId, intentId, response }) => {
+  const { res } = await importableIntent(event, projectId, intentId, response);
+  if (res) return res;
+  const data = body ? JSON.parse(body) : {};
+  try {
+    const upload = await createImportUpload({
+      s3,
+      bucket: ARTIFACTS_BUCKET(),
+      intentId,
+      format: data.format,
+      size: data.size,
+    });
+    return response(200, upload);
+  } catch (error) {
+    const mapped = importErrorResponse(error, response);
+    if (mapped) return mapped;
+    throw error;
+  }
+};
+
+// The intent's records projected exactly as an export of `manifest` saw
+// them: live records (an import target is never RUNNING), the pinned plan,
+// and the same distribution alignment.
+const loadImportProjection = async ({ g, projectId, intentId, meta, manifest }) => {
+  const records = await store.getExecutionRecords(intentId, { includeOutputs: false });
+  const planResult = await loadNativeExportPlan(meta);
+  if (!planResult.valid || !planResult.plan) {
+    throw Object.assign(new Error('native-import: the workflow snapshot cannot be resolved'), {
+      code: 'import_plan_unresolved',
+    });
+  }
+  const stages = [
+    ...planResult.plan.stages,
+    ...(planResult.plan.skippedStages ?? []).map((stage) => ({ ...stage, excluded: true })),
+  ];
+  const projection = buildNativeProjection({
+    intentId,
+    projectId,
+    stages,
+    records,
+    artifacts: await fetchArtifacts(g, intentId),
+    customRules: meta.customRules ?? [],
+  });
+  const upstreamRef = meta.aidlcRepoRef || (await resolveAidlcRepoRef(AIDLC_REPO_REF()));
+  const distribution = await loadDistribution({
+    s3,
+    bucket: ARTIFACTS_BUCKET(),
+    upstreamRef: manifest.native.upstreamRef,
+    harness: manifest.native.harness,
+  });
+  const aligned = alignProjectionToDistribution({
+    projection,
+    distributionFiles: distribution.files,
+    harness: manifest.native.harness,
+  });
+  return { ...aligned, upstreamRef };
+};
+
+// POST /projects/{projectId}/intents/{intentId}/import
+// Re-attach CLI progress to an intent this platform exported. `dryRun: true`
+// returns the preview and its planToken; a confirm repeats the request with
+// that planToken. The run is retired and the intent parks FAILED with
+// META.importedContinuation; Continue is a rewind to that stage.
+const handleImportIntent = async ({ event, body, projectId, intentId, g, response }) => {
+  const { meta, res } = await importableIntent(event, projectId, intentId, response);
+  if (res) return res;
+  const data = body ? JSON.parse(body) : {};
+  let plan;
+  try {
+    const { files, uploadedAt } = await loadImportUpload({
+      s3,
+      bucket: ARTIFACTS_BUCKET(),
+      intentId,
+      uploadId: data.uploadId,
+    });
+    const manifest = readExportManifest(files);
+    const current = await loadImportProjection({ g, projectId, intentId, meta, manifest });
+    plan = planReattach({ files, current, now: uploadedAt ?? manifest.exportedAt });
+  } catch (error) {
+    const mapped = importErrorResponse(error, response);
+    if (mapped) return mapped;
+    throw error;
+  }
+  const preview = importPreview(plan);
+  if (data.dryRun === true) return response(200, { dryRun: true, ...preview });
+  if (data.planToken !== preview.planToken) {
+    return response(409, {
+      error: 'The workspace or the intent changed since the preview. Review the import again.',
+      code: 'import_plan_changed',
+    });
+  }
+  if (plan.workflowComplete) {
+    return response(409, {
+      error:
+        'The CLI finished every stage. Importing a completed workflow is not supported yet, because there is no stage to continue.',
+      code: 'import_workflow_complete',
+    });
+  }
+
+  const responder = getResponder(event);
+  const actor = responder.displayName || responder.sub;
+  const importId = `import-${randomUUID()}`;
+  const importedAt = new Date().toISOString();
+  // Take the run away from any orchestrator first, as rewind does: a woken
+  // run no longer owns the execution and exits quietly.
+  try {
+    await store.updateExecution({
+      executionId: intentId,
+      projectId,
+      status: 'FAILED',
+      fromStatus: meta.status,
+      startedAt: meta.startedAt,
+      pendingHumanTaskId: null,
+      resumeRequired: null,
+      failureReason: 'import_in_progress',
+      completedAt: null,
+      ifOrchestratorRunId: meta.orchestratorRunId,
+      orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
+    });
+  } catch (error) {
+    if (error?.name === 'ConditionalCheckFailedException') {
+      return response(409, {
+        error: 'The intent changed while the import started. Review the import again.',
+        code: 'execution_changed',
+      });
+    }
+    throw error;
+  }
+  try {
+    await stopRuntimeSessions(intentId, meta);
+    const written = await writeImportedRecords({
+      store,
+      createWriter: (scope) => createGraphWriter({ g, scope }),
+      applyArtifactEdit: (input) => applyArtifactEdit({ g, ...input }),
+      intentId,
+      projectId,
+      aidlcRepoRef: meta.aidlcRepoRef ?? plan.upstreamRef,
+      plan,
+      importId,
+      actor: responder,
+      now: importedAt,
+    });
+    // Answered gates no longer wake their parked callback; release it the
+    // way retireParkedRun releases the gates it supersedes.
+    for (const gate of written.answered.filter((task) => task.callbackId)) {
+      await lambdaClient
+        .send(
+          new SendDurableExecutionCallbackSuccessCommand({
+            CallbackId: gate.callbackId,
+            Result: Buffer.from(JSON.stringify({ cancelled: true, reason: importId })),
+          }),
+        )
+        .catch((err) => logger.error('Import callback release failed', err));
+    }
+    await retireParkedRun(intentId, `imported from the CLI (${importId})`);
+    const updated = await store.updateExecution({
+      executionId: intentId,
+      failureReason: 'imported_from_cli',
+      importedContinuation: { importId, stageId: plan.continuationStageId, importedAt },
+    });
+    await store
+      .appendEvent({
+        executionId: intentId,
+        type: 'v2.execution.imported',
+        actor,
+        summary: `${actor} imported CLI progress (${plan.stageCompletions.length} stage(s), ${plan.artifactWrites.length} artifact(s)); continue at ${plan.continuationStageId}`,
+      })
+      .catch((err) => logger.error('Import event append failed', err));
+    return response(201, {
+      importId,
+      ...preview,
+      intent: mapIntent({ ...meta, ...updated }),
+    });
+  } catch (error) {
+    logger.error('Native workspace import failed after the run was retired', error);
+    await store
+      .updateExecution({ executionId: intentId, failureReason: 'import_failed' })
+      .catch((err) => logger.error('Import failure marker write failed', err));
+    await store
+      .appendEvent({
+        executionId: intentId,
+        type: 'v2.execution.import_failed',
+        actor,
+        summary: `${actor}'s CLI import ${importId} failed part-way: ${error.message}. Rewind to the earliest imported stage to recover.`,
+      })
+      .catch((err) => logger.error('Import failure event append failed', err));
+    const mapped = importErrorResponse(error, response);
+    if (mapped) return mapped;
+    return response(500, {
+      error: 'The import failed part-way. The intent is marked failed; rewind it to recover.',
+      code: 'import_failed',
     });
   }
 };
@@ -5187,6 +5470,7 @@ const handleRewindIntent = async ({ event, body, projectId, intentId, g, respons
       startedAt: meta.startedAt,
       pendingHumanTaskId: null,
       resumeRequired: null,
+      importedContinuation: null,
       failureReason: 'rewind_in_progress',
       completedAt: null,
       ifOrchestratorRunId: meta.orchestratorRunId,
@@ -6711,7 +6995,9 @@ export const handler = async (event, context) => {
     if (
       intentId &&
       (httpMethod === 'DELETE' ||
-        (httpMethod === 'POST' && /\/(rewind|recompose|cancel|repair)$/.test(path ?? '')))
+        (httpMethod === 'POST' &&
+          (/\/(rewind|recompose|cancel|repair)$/.test(path ?? '') ||
+            INTENT_IMPORT_PATH.test(path ?? ''))))
     ) {
       const current = await store.getExecution(intentId, { consistentRead: true });
       if (current?.projectId === projectId && Date.parse(current.deliveryLeaseUntil) > Date.now()) {
@@ -6739,6 +7025,14 @@ export const handler = async (event, context) => {
 
     if (intentId && httpMethod === 'POST' && path?.endsWith('/export')) {
       return await handleExportIntent({ event, body, projectId, intentId, g, response });
+    }
+
+    if (intentId && httpMethod === 'POST' && INTENT_IMPORT_UPLOAD_PATH.test(path ?? '')) {
+      return await handleImportUpload({ event, body, projectId, intentId, response });
+    }
+
+    if (intentId && httpMethod === 'POST' && INTENT_IMPORT_PATH.test(path ?? '')) {
+      return await handleImportIntent({ event, body, projectId, intentId, g, response });
     }
 
     if (intentId && httpMethod === 'POST' && path?.endsWith('/realtime-token')) {

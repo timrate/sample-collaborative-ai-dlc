@@ -583,6 +583,10 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     orchestratorExpiresAt,
     rewindFromStageId,
     resumeRequired,
+    // Set by a native-workspace re-attach import (intents/native-import.js):
+    // the run was retired and the intent waits for a member to continue it at
+    // `stageId` (null when the CLI finished every stage). Cleared on relaunch.
+    importedContinuation,
     currentPhase,
     currentStage,
     pendingHumanTaskId,
@@ -803,6 +807,21 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     } else if (resumeRequired !== undefined) {
       sets.push('resumeRequired = :rsr');
       values[':rsr'] = resumeRequired;
+    }
+    if (importedContinuation === null) {
+      removes.push('importedContinuation');
+    } else if (importedContinuation !== undefined) {
+      const { importId, stageId, importedAt } = importedContinuation ?? {};
+      if (
+        typeof importId !== 'string' ||
+        !importId ||
+        typeof importedAt !== 'string' ||
+        !(stageId === null || (typeof stageId === 'string' && stageId))
+      ) {
+        throw new Error('invalid importedContinuation');
+      }
+      sets.push('importedContinuation = :imc');
+      values[':imc'] = { importId, stageId, importedAt };
     }
     // The autonomy-ladder decision (docs/v2-parallel.md A2 rule 9), stamped by
     // the orchestrator when the human answers the ladder prompt. Validated at

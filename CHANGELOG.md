@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Import CLI progress.** A project member can bring workflow progress made in a native AI-DLC harness back to the intent it was exported from, from the workspace ZIP or from a workspace repository branch. Sequential stages the CLI completed are recorded, with their artifacts (marked as imported) and question answers. The intent then waits to be continued at the next stage. The import shows a preview first, and refuses a workspace when the intent changed in the UI after the export. Construction unit progress is not imported yet. See [Importing CLI Progress](docs/using-the-platform/importing-cli-progress.md).
+
+### Notes
+
+- **Deployment.** The import adds the `POST /projects/{projectId}/intents/{intentId}/import` and `/import/upload` API routes. It also adds intents Lambda access to the `workflow-imports/` prefix of the artifacts bucket, and a one-day expiry rule for that prefix. Apply Terraform before using it.
+
 ## [2.3.1] - 2026-11-13
 
 Hotfix that keeps AgentCore microVM runtimes on platform V1 ([#758](https://github.com/aws-samples/sample-collaborative-ai-dlc/pull/758)) and passes domain and SSO settings to release deployments ([#769](https://github.com/aws-samples/sample-collaborative-ai-dlc/pull/769)).

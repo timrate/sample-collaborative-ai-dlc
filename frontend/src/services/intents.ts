@@ -115,6 +115,7 @@ export interface Intent {
   // completed: the run is parked with nothing able to wake it until someone
   // resumes it. Drives the Resume run action.
   resumeRequired?: IntentResumeRequired | null;
+  importedContinuation?: IntentImportedContinuation | null;
   agentCli?: AgentCli | null;
   credentialSource?: AgentCredentialSource | null;
   credentialConnection?: {
@@ -247,6 +248,49 @@ export interface NativeWorkflowExport {
 }
 
 export type NativeExportHarness = AgentCli | 'kiro-ide';
+
+// CLI re-attach import (lambda/intents/native-import.js). The workspace is
+// uploaded once (export ZIP, or a JSON bundle built from a branch), previewed
+// with `dryRun`, then confirmed with the preview's planToken.
+export type NativeImportFormat = 'zip' | 'json';
+
+export interface NativeImportUpload {
+  uploadId: string;
+  url: string;
+  fields: Record<string, string>;
+  expiresIn: number;
+}
+
+export interface NativeImportPreview {
+  planToken: string;
+  continuationStageId: string | null;
+  workflowComplete: boolean;
+  stageCompletions: Array<{ stageId: string; phase: string; completedAt: string }>;
+  artifactWrites: Array<{
+    path: string;
+    artifactType: string;
+    stageId: string;
+    change: 'create' | 'update';
+    bytes: number;
+  }>;
+  answeredGates: Array<{ humanTaskId: string; stageId: string }>;
+  resolvedGates: Array<{ humanTaskId: string; kind: string; stageId: string }>;
+  ignoredFiles: Array<{ path: string; reason: string }>;
+  warnings: string[];
+}
+
+export interface NativeImportResult extends NativeImportPreview {
+  importId: string;
+  intent: Intent;
+}
+
+// Set after a CLI import until the intent is continued (rewound) at
+// `stageId`.
+export interface IntentImportedContinuation {
+  importId: string;
+  stageId: string | null;
+  importedAt: string;
+}
 
 // Shape mirrors the plan resolver's error objects (lambda/shared/v2-execution-plan.js).
 export interface PlanWarning {
@@ -578,7 +622,7 @@ export interface IntentArtifact {
   editedBy?: string | null;
   editedByName?: string | null;
   editedAt?: string | null;
-  editOrigin?: 'human' | 'quorum' | null;
+  editOrigin?: 'human' | 'quorum' | 'cli-import' | null;
   // Verification stamp ("reviewed against the upstream edit, still valid").
   verifiedBy?: string | null;
   verifiedByName?: string | null;
@@ -629,7 +673,7 @@ export interface ArtifactVersion extends ArtifactVersionSummary {
     artifactId: string;
   }[];
   editedBy: string | null;
-  editOrigin: 'human' | 'quorum' | null;
+  editOrigin: 'human' | 'quorum' | 'cli-import' | null;
   verifiedBy: string | null;
   verifiedByName: string | null;
   verifiedAt: string | null;
@@ -1335,6 +1379,22 @@ export const intentsService = {
       `/projects/${projectId}/intents/${intentId}/export`,
       harness ? { harness } : {},
     ),
+  createImportUpload: (
+    projectId: string,
+    intentId: string,
+    input: { format: NativeImportFormat; size: number },
+  ) =>
+    api.post<NativeImportUpload>(`/projects/${projectId}/intents/${intentId}/import/upload`, input),
+  previewImport: (projectId: string, intentId: string, uploadId: string) =>
+    api.post<NativeImportPreview & { dryRun: true }>(
+      `/projects/${projectId}/intents/${intentId}/import`,
+      { uploadId, dryRun: true },
+    ),
+  confirmImport: (projectId: string, intentId: string, uploadId: string, planToken: string) =>
+    api.post<NativeImportResult>(`/projects/${projectId}/intents/${intentId}/import`, {
+      uploadId,
+      planToken,
+    }),
   // Permanent delete: removes the intent's graph data, process state and
   // realtime docs. Owner/admin only; refused (409) while RUNNING.
   delete: (projectId: string, intentId: string) =>
