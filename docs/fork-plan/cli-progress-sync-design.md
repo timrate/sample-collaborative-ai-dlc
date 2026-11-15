@@ -97,15 +97,15 @@ B1 is usable on its own: a person imports with **Keep syncing**, and the next im
 
 Implementation found three things the plan above did not account for. These decisions were made during B1, on 2026-11-14 and 2026-11-15.
 
-1. **The runtime command moved to its own PR, before B2.** `sync-cli-progress` cannot run in the runtime as planned, for three reasons:
+1. **Sync runs in the intents Lambda, not in a runtime command.** `sync-cli-progress` cannot run in the runtime as planned, for three reasons:
    - The projection (`buildNativeProjection`, `loadNativeExportPlan`, distribution alignment) and the PR #1 writer live in `lambda/intents`, which `lambda/agentcore` may not import.
    - With `enable_engine_data`, the runtime has no allowlisted operations for artifact creation, gate answers, the S3 baseline or the distribution read.
    - The broker returns a git credential. For CodeCommit, that is not a provider API credential.
 
-   B1 therefore runs sync in the intents import endpoint, which already has the graph, the S3 grants and the writer. The runtime-command PR moves the projection and the writer into `lambda/shared` and adds the engine-data operations, with its own design addendum.
+   B1 therefore runs sync in the intents import endpoint, which already has the graph, the S3 grants and the writer. For B2, the orchestrator calls an internal `sync-cli-progress` action on the intents Lambda, the same way it already calls the source-control Lambda's `operate` action. That action is its own PR between B1 and B2.
 
 2. **The branch is read through the source-control Lambda.** `readWorkspaceBranch` (`lambda/shared/native-workspace-source.js`) takes a shared-git-provider shape. The intents Lambda backs it with the source-control Lambda's `operate` action, which checks that the repository is attached to the project and resolves the binding's own read credential. B1 adds a read-only `branch-head` operation there. This works for every provider, and no credential reaches the intents Lambda. The browser no longer builds the branch bundle; the JSON bundle upload stays supported.
-3. **The broker read rule is narrower than planned.** `resolveBindingCredential` narrows `read` only for GitHub App and CodeCommit role bindings. A delegated OAuth token is the same token for read and write. The broker therefore issues a linked-repository read credential only through those two binding types, and refuses the others with `OPERATION_NOT_ALLOWED`. B2's automatic sync through the broker is limited to GitHub App and CodeCommit until OAuth reads can be narrowed.
+3. **No credential broker change.** The branch is read through the source-control Lambda (item 2), and sync never runs in the runtime (item 1), so nothing needs a broker credential for the linked repository. The rule planned in step 4 above was built and then removed before review. `executionIncludesRepository` still allows only `META.repos`. This also avoids a limit the rule had: a delegated OAuth token is the same token for read and write, so the broker could only have offered the read through GitHub App and CodeCommit role bindings.
 
 Other details fixed in B1:
 
@@ -150,11 +150,12 @@ Other details fixed in B1:
 
 ## Risks and open items
 
-- **Credential scope:** the broker change in B1-4 widens what a runtime session can read. It is read-only and limited to the one linked repository, which a project member chose. This needs an explicit security review in the PR.
+- **Credential scope:** no change. The broker rule planned in B1-4 was dropped (see "B1 as built"). The branch read uses the project's own binding through the source-control Lambda, which checks that the repository is attached to the project, and no credential reaches the intents Lambda or the runtime.
 - **Plan drift:** a CLI that changed scope (EXECUTE/SKIP) or the release still refuses, as in PR #1. Sync then reports `v2.cli.sync_failed` with the refusal code on every stage until someone unlinks or fixes the branch. B2 should emit this once per head SHA, not once per stage.
 - **Cost:** a read per stage is one branch-head call when nothing changed, and a tree read plus file reads when the branch moved. Rate limits are not a concern at stage frequency.
 - **Construction units:** still out of scope, as in PR #1. That is Phase 2 work ("parallel units").
 - **Writing back to the CLI** (UI progress pushed to the workspace branch) is out of scope. That is Phase 3's "UI learnings written back as a PR".
 - **Verification:**
-  - B1: unit tests for `planSync` on every row of both tables above, broker allow and deny tests, and command idempotency on a replayed `headSha`.
+  - B1: unit tests for `planSync` on every row of both tables above.
+  - The internal sync action: idempotency on a replayed `headSha`, and the run-ownership fence on DynamoDB Local.
   - B2: orchestrator replay tests showing that a run claimed without `cliSyncMode` keeps its exact step names, and a deployed-stack check with a real workspace repository.

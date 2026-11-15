@@ -15,7 +15,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Deployment.** The import adds the `POST /projects/{projectId}/intents/{intentId}/import` and `/import/upload` API routes. It also adds intents Lambda access to the `workflow-imports/` prefix of the artifacts bucket, and a one-day expiry rule for that prefix. Apply Terraform before using it.
 - **Deployment.** CLI sync adds the `DELETE /projects/{projectId}/intents/{intentId}/cli-sync` route, intents and projects Lambda access to the `workflow-sync/` prefix of the artifacts bucket, a lifecycle rule that expires superseded versions under that prefix after one day, and a read-only `branch-head` operation in the source-control Lambda. Apply Terraform and deploy the Lambdas together.
-- **Security.** The credential broker can now issue a **read** credential for an execution's linked workspace repository (`META.cliSync.repo`) while the execution is `CREATED` or `RUNNING`. Write and identity requests for it are refused, and so are bindings whose read credential is not narrower than write (delegated OAuth). Nothing in this release requests that credential yet; it is for the automatic sync step that follows.
 
 ## [2.3.1] - 2026-11-13
 
