@@ -116,6 +116,7 @@ export interface Intent {
   // resumes it. Drives the Resume run action.
   resumeRequired?: IntentResumeRequired | null;
   importedContinuation?: IntentImportedContinuation | null;
+  cliSync?: IntentCliSync | null;
   agentCli?: AgentCli | null;
   credentialSource?: AgentCredentialSource | null;
   credentialConnection?: {
@@ -249,10 +250,39 @@ export interface NativeWorkflowExport {
 
 export type NativeExportHarness = AgentCli | 'kiro-ide';
 
-// CLI re-attach import (lambda/intents/native-import.js). The workspace is
-// uploaded once (export ZIP, or a JSON bundle built from a branch), previewed
-// with `dryRun`, then confirmed with the preview's planToken.
+// CLI re-attach import (lambda/intents/native-import.js). The workspace is an
+// uploaded export ZIP, or a repository branch the backend reads. It is
+// previewed with `dryRun`, then confirmed with the preview's planToken (and,
+// for a branch, the preview's plannedAt).
 export type NativeImportFormat = 'zip' | 'json';
+
+export interface NativeImportBranchSource {
+  provider: string;
+  repo: string;
+  branch: string;
+}
+
+export type NativeImportRequest =
+  | { uploadId: string }
+  | { source: NativeImportBranchSource; keepSyncing?: boolean };
+
+export interface NativeImportConflict {
+  kind: 'stage' | 'artifact';
+  stageId: string | null;
+  path?: string;
+  reason?: 'both_completed' | 'ui_in_progress';
+}
+
+// The branch an intent syncs CLI progress from (Keep syncing on import).
+export interface IntentCliSync {
+  repo: string;
+  provider: string;
+  branch: string;
+  linkedBy: string;
+  linkedAt: string;
+  lastSyncedSha: string | null;
+  lastSyncedAt: string | null;
+}
 
 export interface NativeImportUpload {
   uploadId: string;
@@ -277,6 +307,20 @@ export interface NativeImportPreview {
   resolvedGates: Array<{ humanTaskId: string; kind: string; stageId: string }>;
   ignoredFiles: Array<{ path: string; reason: string }>;
   warnings: string[];
+  // Branch sources only.
+  headSha?: string;
+  plannedAt?: string;
+  // Set when the intent is linked: the plan compares against the last sync.
+  sync?: boolean;
+  conflicts?: NativeImportConflict[];
+  uiOwnedFiles?: string[];
+}
+
+// A linked branch whose head has not moved since the last sync.
+export interface NativeImportUnchanged {
+  dryRun: boolean;
+  unchanged: true;
+  headSha: string;
 }
 
 export interface NativeImportResult extends NativeImportPreview {
@@ -1385,16 +1429,25 @@ export const intentsService = {
     input: { format: NativeImportFormat; size: number },
   ) =>
     api.post<NativeImportUpload>(`/projects/${projectId}/intents/${intentId}/import/upload`, input),
-  previewImport: (projectId: string, intentId: string, uploadId: string) =>
-    api.post<NativeImportPreview & { dryRun: true }>(
+  previewImport: (projectId: string, intentId: string, request: NativeImportRequest) =>
+    api.post<(NativeImportPreview & { dryRun: true }) | NativeImportUnchanged>(
       `/projects/${projectId}/intents/${intentId}/import`,
-      { uploadId, dryRun: true },
+      { ...request, dryRun: true },
     ),
-  confirmImport: (projectId: string, intentId: string, uploadId: string, planToken: string) =>
+  confirmImport: (
+    projectId: string,
+    intentId: string,
+    request: NativeImportRequest,
+    preview: Pick<NativeImportPreview, 'planToken' | 'plannedAt'>,
+  ) =>
     api.post<NativeImportResult>(`/projects/${projectId}/intents/${intentId}/import`, {
-      uploadId,
-      planToken,
+      ...request,
+      planToken: preview.planToken,
+      ...(preview.plannedAt ? { plannedAt: preview.plannedAt } : {}),
     }),
+  // Stop syncing CLI progress from the linked branch.
+  unlinkCliSync: (projectId: string, intentId: string) =>
+    api.delete(`/projects/${projectId}/intents/${intentId}/cli-sync`),
   // Permanent delete: removes the intent's graph data, process state and
   // realtime docs. Owner/admin only; refused (409) while RUNNING.
   delete: (projectId: string, intentId: string) =>

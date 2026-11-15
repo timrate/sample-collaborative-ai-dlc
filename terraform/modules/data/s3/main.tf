@@ -100,6 +100,27 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
       noncurrent_days = 1
     }
   }
+
+  # CLI sync baselines live as long as the intent's link: they are outside
+  # workflow-imports/ so the one-day expiry above never removes a current
+  # baseline. Each sync writes a new object and deletes the previous one, so
+  # only those superseded versions expire here.
+  rule {
+    id     = "expire_superseded_sync_baselines"
+    status = "Enabled"
+
+    filter {
+      prefix = "workflow-sync/"
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }
 }
 
 # Code snapshots bucket for agent code outputs

@@ -273,16 +273,21 @@ const assertUnchangedSinceExport = ({ baseline, manifest }) => {
   }
 };
 
-const compareStageMarkers = ({ stages, baselineStages, incoming }) => {
-  const baselineMarker = new Map(baselineStages.map((stage) => [stage.stageId, stage.marker]));
-  const unknown = [...incoming.keys()].filter((stageId) => !baselineMarker.has(stageId));
-  const missing = stages.map((stage) => stage.stageId).filter((stageId) => !incoming.has(stageId));
+const assertStagesMatchPlan = ({ stages, incoming }) => {
+  const planned = new Set(stages.map((stage) => stage.stageId));
+  const unknown = [...incoming.keys()].filter((stageId) => !planned.has(stageId));
+  const missing = [...planned].filter((stageId) => !incoming.has(stageId));
   if (unknown.length > 0 || missing.length > 0) {
     throw importError(
       'import_state_invalid',
       `the state file's stages differ from the intent's plan (missing: ${missing.join(', ') || 'none'}; unknown: ${unknown.join(', ') || 'none'})`,
     );
   }
+};
+
+const compareStageMarkers = ({ stages, baselineStages, incoming }) => {
+  const baselineMarker = new Map(baselineStages.map((stage) => [stage.stageId, stage.marker]));
+  assertStagesMatchPlan({ stages, incoming });
   const newlyCompleted = [];
   let firstUnfinished = null;
   for (const stage of stages) {
@@ -388,43 +393,28 @@ const planQuestionAnswers = ({ stageId, tasks, text, path }) => {
   return { writes, exact };
 };
 
-const planReattach = ({ files: rawFiles, current, now = new Date().toISOString() }) => {
-  const files = normalizeFiles(rawFiles);
-  const manifest = parseManifest(files);
-  const intentId = current?.intent?.intentId;
-  if (manifest.source.intentId !== intentId) {
-    throw importError(
-      'import_intent_mismatch',
-      `this workspace was exported from intent ${manifest.source.intentId}, not ${intentId}`,
-    );
-  }
-  if (manifest.native.upstreamRef !== current.upstreamRef) {
-    throw importError(
-      'import_release_mismatch',
-      `this workspace uses AI-DLC ${manifest.native.upstreamRef}, but the intent is pinned to ${current.upstreamRef}`,
-    );
-  }
-
-  const baseline = projectBaseline({ current, manifest });
-  assertUnchangedSinceExport({ baseline, manifest });
-
-  const recordRoot = recordRootFor(manifest);
-  const statePath = `${recordRoot.path}/aidlc-state.md`;
-  const stateText = files.get(statePath);
-  if (stateText == null) {
-    throw importError('import_state_invalid', `${statePath} is missing`);
-  }
+// The part of a plan both entry points share: which changed CLI files become
+// artifact writes and gate answers for the stages being imported. The callers
+// decide which files changed (against the export, or against the sync
+// baseline) and hand them to `importFile`.
+const createImportPlanner = ({
+  files,
+  current,
+  manifest,
+  projected,
+  recordRoot,
+  baseMarker,
+  newlyCompleted,
+  conflictedStageIds = new Set(),
+  completedWhen,
+  now,
+}) => {
   const stages = current.stages;
-  const { baselineMarker, newlyCompleted, continuation } = compareStageMarkers({
-    stages,
-    baselineStages: baseline.stages,
-    incoming: parseStageMarkers(stateText),
-  });
   const stageById = new Map(stages.map((stage) => [stage.stageId, stage]));
   const newlyCompletedIds = new Set(newlyCompleted.map((stage) => stage.stageId));
   const stageRows = current.stageRows ?? [];
   const humanTasks = current.humanTasks ?? [];
-  const repositories = baseline.manifest.repositories;
+  const repositories = projected.manifest.repositories;
   const runtimeStages = parseRuntimeGraph(files.get(`${recordRoot.path}/runtime-graph.json`));
 
   const stageCompletions = newlyCompleted.map((stage) => {
@@ -441,7 +431,7 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
 
   // Where each current artifact lands in the workspace, using the projector's
   // own path rule so the two directions cannot drift.
-  const projectedStageById = new Map(baseline.stages.map((stage) => [stage.stageId, stage]));
+  const projectedStageById = new Map(projected.stages.map((stage) => [stage.stageId, stage]));
   const artifactByPath = new Map();
   for (const artifact of current.artifacts ?? []) {
     const path = artifactPath({
@@ -454,7 +444,6 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
     artifactByPath.set(path, artifact);
   }
 
-  const exportedSha = new Map(manifest.files.map((entry) => [entry.path, entry.sha256]));
   const tasksByStage = questionTasksByStage({ humanTasks, stageRows });
   const artifactWrites = [];
   const answers = [];
@@ -462,21 +451,16 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
   const warnings = [];
   const ignore = (path, reason) => ignoredFiles.push({ path, reason });
 
-  for (const [path, text] of [...files].toSorted(([left], [right]) => left.localeCompare(right))) {
-    if (path === 'export-manifest.json') continue;
-    const baselineBody = baseline.files.get(path);
-    const changed =
-      baselineBody != null ? baselineBody !== text : exportedSha.get(path) !== sha256(text);
-    if (!changed) continue;
+  // The state file, the runtime graph and the audit log are derived from the
+  // stage records; they are never imported as content.
+  const isBookkeeping = (path) => {
     const recordFile = path.startsWith(`${recordRoot.path}/`)
       ? path.slice(recordRoot.path.length + 1)
       : null;
-    if (ROOT_RECORD_FILES.has(recordFile) || recordFile?.startsWith('audit/')) continue;
-    if (baselineBody == null && exportedSha.has(path)) {
-      ignore(path, 'methodology and harness files are not imported');
-      continue;
-    }
+    return ROOT_RECORD_FILES.has(recordFile) || Boolean(recordFile?.startsWith('audit/'));
+  };
 
+  const locate = (path) => {
     const existing = artifactByPath.get(path) ?? null;
     const location = existing
       ? {
@@ -486,24 +470,33 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
           repository: existing.repository ?? null,
         }
       : locateFile({ path, recordRoot, stageById, repositories });
+    return { existing, location };
+  };
+
+  const importFile = (path, text) => {
+    const { existing, location } = locate(path);
     if (!location) {
       ignore(path, 'files outside the intent record are not imported');
-      continue;
+      return;
     }
     const stage = stageById.get(location.stageId);
-    if (baselineMarker.get(stage.stageId) === 'x') {
+    if (baseMarker.get(stage.stageId) === 'x') {
       throw importError(
         'import_completed_stage_changed',
-        `${path} changed, but stage ${stage.stageId} was already complete at export; edit it in the UI instead`,
+        `${path} changed, but stage ${stage.stageId} was already complete ${completedWhen}; edit it in the UI instead`,
       );
+    }
+    if (conflictedStageIds.has(stage.stageId)) {
+      ignore(path, `stage ${stage.stageId} is in conflict`);
+      return;
     }
     if (!newlyCompletedIds.has(stage.stageId)) {
       ignore(path, `stage ${stage.stageId} is not complete in the CLI workspace`);
-      continue;
+      return;
     }
     if (location.unitSlug) {
       ignore(path, 'per-unit artifacts are not imported yet');
-      continue;
+      return;
     }
 
     const questionName = `${stage.stageId}-questions`;
@@ -515,7 +508,7 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
         path,
       });
       answers.push(...writes);
-      if (exact) continue;
+      if (exact) return;
       // The CLI answer text does not re-render identically (for example a
       // bare "B"). Keep the file itself as the authoritative question
       // artifact so the next export reproduces what the CLI user wrote.
@@ -524,7 +517,7 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
       !(stage.produces ?? []).some((type) => slugify(type) === location.name)
     ) {
       ignore(path, `not a declared output of stage ${stage.stageId}`);
-      continue;
+      return;
     }
 
     artifactWrites.push({
@@ -540,47 +533,389 @@ const planReattach = ({ files: rawFiles, current, now = new Date().toISOString()
       previousArtifactId: existing?.id ?? null,
       content: text,
     });
+  };
+
+  const finish = ({ continuation, isRemoval = () => true }) => {
+    // Only artifacts count: cursors and runtime-graph.json are gitignored by
+    // the CLI, so a branch checkout never has them.
+    for (const path of artifactByPath.keys()) {
+      if (!files.has(path) && isRemoval(path)) {
+        warnings.push(`${path} was removed in the CLI workspace; removals are not imported.`);
+      }
+    }
+
+    const answered = new Set(answers.map((answer) => answer.humanTaskId));
+    const gateResolutions = [];
+    for (const stage of newlyCompleted) {
+      for (const task of tasksByStage.get(stage.stageId) ?? []) {
+        if (task.status !== 'pending' || answered.has(task.humanTaskId)) continue;
+        if (task.kind === 'question') {
+          warnings.push(
+            `Question gate ${task.humanTaskId} on ${stage.stageId} has no answer in the CLI workspace; it will be resolved without one.`,
+          );
+        }
+        gateResolutions.push({
+          humanTaskId: task.humanTaskId,
+          kind: task.kind,
+          stageId: stage.stageId,
+        });
+      }
+    }
+
+    return {
+      intentId: current.intent.intentId,
+      exportedAt: manifest.exportedAt,
+      upstreamRef: manifest.native.upstreamRef,
+      harness: manifest.native.harness,
+      continuationStageId: continuation?.stageId ?? null,
+      workflowComplete: continuation === null,
+      stageCompletions,
+      artifactWrites,
+      answers,
+      gateResolutions,
+      ignoredFiles,
+      warnings,
+    };
+  };
+
+  return { ignore, isBookkeeping, locate, importFile, finish };
+};
+
+// The checks every import starts with: a valid manifest for this intent and
+// release, and the intent's records projected with the manifest's settings.
+const openWorkspace = ({ rawFiles, current }) => {
+  const files = normalizeFiles(rawFiles);
+  const manifest = parseManifest(files);
+  const intentId = current?.intent?.intentId;
+  if (manifest.source.intentId !== intentId) {
+    throw importError(
+      'import_intent_mismatch',
+      `this workspace was exported from intent ${manifest.source.intentId}, not ${intentId}`,
+    );
+  }
+  if (manifest.native.upstreamRef !== current.upstreamRef) {
+    throw importError(
+      'import_release_mismatch',
+      `this workspace uses AI-DLC ${manifest.native.upstreamRef}, but the intent is pinned to ${current.upstreamRef}`,
+    );
+  }
+  return { files, manifest, projected: projectBaseline({ current, manifest }) };
+};
+
+const readStateMarkers = ({ files, recordRoot }) => {
+  const statePath = `${recordRoot.path}/aidlc-state.md`;
+  const stateText = files.get(statePath);
+  if (stateText == null) {
+    throw importError('import_state_invalid', `${statePath} is missing`);
+  }
+  return parseStageMarkers(stateText);
+};
+
+const sortedFiles = (files) => [...files].toSorted(([left], [right]) => left.localeCompare(right));
+
+const planReattach = ({ files: rawFiles, current, now = new Date().toISOString() }) => {
+  const { files, manifest, projected: baseline } = openWorkspace({ rawFiles, current });
+  assertUnchangedSinceExport({ baseline, manifest });
+
+  const recordRoot = recordRootFor(manifest);
+  const { baselineMarker, newlyCompleted, continuation } = compareStageMarkers({
+    stages: current.stages,
+    baselineStages: baseline.stages,
+    incoming: readStateMarkers({ files, recordRoot }),
+  });
+  const planner = createImportPlanner({
+    files,
+    current,
+    manifest,
+    projected: baseline,
+    recordRoot,
+    baseMarker: baselineMarker,
+    newlyCompleted,
+    completedWhen: 'at export',
+    now,
+  });
+
+  const exportedSha = new Map(manifest.files.map((entry) => [entry.path, entry.sha256]));
+  for (const [path, text] of sortedFiles(files)) {
+    if (path === 'export-manifest.json') continue;
+    const baselineBody = baseline.files.get(path);
+    const changed =
+      baselineBody != null ? baselineBody !== text : exportedSha.get(path) !== sha256(text);
+    if (!changed || planner.isBookkeeping(path)) continue;
+    if (baselineBody == null && exportedSha.has(path)) {
+      planner.ignore(path, 'methodology and harness files are not imported');
+      continue;
+    }
+    planner.importFile(path, text);
   }
 
-  // Only artifacts count: cursors and runtime-graph.json are gitignored by
-  // the CLI, so a branch checkout never has them.
-  for (const path of artifactByPath.keys()) {
-    if (!files.has(path)) {
-      warnings.push(`${path} was removed in the CLI workspace; removals are not imported.`);
+  return planner.finish({ continuation });
+};
+
+// Continuous sync (docs/fork-plan/cli-progress-sync-design.md). Once an intent
+// is linked to a branch, both sides keep moving, so the strict comparison
+// above no longer fits. A sync compares three versions of every intent-record
+// file and stage marker: the baseline, the UI's projection today, and the
+// branch.
+//
+// The baseline is the common ancestor: the last value both sides agreed on.
+// It advances for a path or stage only when the UI and the branch hold the
+// same value after the sync (an import, or the same change made twice). A
+// change only one side made leaves the ancestor where it is, so the other
+// side changing the same thing later is still seen as a conflict.
+const SYNC_BASELINE_VERSION = 1;
+const UI_ACTIVE_STATES = new Set(['RUNNING', 'WAITING_FOR_HUMAN']);
+
+const rowSignature = (row) => (row ? `${row.state}@${row.startedAt ?? ''}` : null);
+
+const inIntentRecord = (path, recordRoot) =>
+  path.startsWith(`${recordRoot.path}/`) ||
+  (recordRoot.space !== null && path.startsWith(`aidlc/spaces/${recordRoot.space}/codekb/`));
+
+const assertSyncBaseline = ({ baseline, current }) => {
+  const valid =
+    baseline?.schemaVersion === SYNC_BASELINE_VERSION &&
+    baseline.intentId === current?.intent?.intentId &&
+    baseline.files !== null &&
+    typeof baseline.files === 'object' &&
+    baseline.stages !== null &&
+    typeof baseline.stages === 'object' &&
+    current.stages.every((stage) => typeof baseline.stages[stage.stageId]?.marker === 'string');
+  if (!valid) {
+    throw importError(
+      'import_sync_baseline_invalid',
+      'this intent has no usable sync baseline; unlink the branch and import again with Keep syncing',
+    );
+  }
+};
+
+const compareSyncMarkers = ({ stages, stageRows, projectedStages, baseline, incoming }) => {
+  assertStagesMatchPlan({ stages, incoming });
+  const uiMarker = new Map(projectedStages.map((stage) => [stage.stageId, stage.marker]));
+  const baseMarker = new Map(stages.map((s) => [s.stageId, baseline.stages[s.stageId].marker]));
+  const newlyCompleted = [];
+  const conflicts = [];
+  let firstUnfinished = null;
+  for (const stage of stages) {
+    const { stageId } = stage;
+    const before = baseMarker.get(stageId);
+    const cli = incoming.get(stageId);
+    const ui = uiMarker.get(stageId);
+    if (before === 'x' && cli !== 'x') {
+      throw importError(
+        'import_stage_regressed',
+        `stage ${stageId} was complete at the last sync but is [${cli}] in the CLI workspace; rewinds are not imported`,
+      );
+    }
+    if ((before === 'S') !== (cli === 'S')) {
+      throw importError(
+        'import_scope_changed',
+        `stage ${stageId} changed between EXECUTE and SKIP in the CLI workspace`,
+      );
+    }
+    if (cli === 'x' && before !== 'x') {
+      const row = stageRowFor(stageRows, stageId);
+      const uiStarted =
+        UI_ACTIVE_STATES.has(row?.state) && rowSignature(row) !== baseline.stages[stageId].uiRow;
+      if (ui === 'x') {
+        conflicts.push({ kind: 'stage', stageId, reason: 'both_completed' });
+      } else if (uiStarted) {
+        conflicts.push({ kind: 'stage', stageId, reason: 'ui_in_progress' });
+      } else {
+        if (firstUnfinished) {
+          throw importError(
+            'import_stage_gap',
+            `stage ${stageId} is complete but the earlier stage ${firstUnfinished.stageId} is not`,
+          );
+        }
+        if (isPerUnitStage(stage)) {
+          throw importError(
+            'import_parallel_unsupported',
+            `stage ${stageId} runs per unit of work; importing Construction unit progress is not supported yet`,
+          );
+        }
+        newlyCompleted.push(stage);
+      }
+    }
+    // A stage either side finished is finished: one the UI completed and the
+    // CLI has not is the UI's progress, not a CLI rewind.
+    if (!firstUnfinished && !DONE_MARKERS.has(cli) && !DONE_MARKERS.has(ui)) {
+      firstUnfinished = stage;
     }
   }
+  return { baseMarker, newlyCompleted, conflicts, continuation: firstUnfinished };
+};
 
-  const answered = new Set(answers.map((answer) => answer.humanTaskId));
-  const gateResolutions = [];
-  for (const stage of newlyCompleted) {
-    for (const task of tasksByStage.get(stage.stageId) ?? []) {
-      if (task.status !== 'pending' || answered.has(task.humanTaskId)) continue;
-      if (task.kind === 'question') {
-        warnings.push(
-          `Question gate ${task.humanTaskId} on ${stage.stageId} has no answer in the CLI workspace; it will be resolved without one.`,
+// The baseline after `plan` is applied: wherever the UI and the branch now
+// agree, the agreed value; everywhere else the previous ancestor. A stage in
+// conflict keeps its ancestor even though both sides completed it, so the
+// conflict is still there on the next sync until someone resolves it.
+const advanceSyncBaseline = ({
+  previous,
+  files,
+  current,
+  manifest,
+  plan,
+  conflictedStageIds = new Set(),
+  headSha,
+  now,
+}) => {
+  const after = applyReattachPlan(current, plan);
+  const projected = projectBaseline({ current: after, manifest });
+  const recordRoot = recordRootFor(manifest);
+  const incoming = readStateMarkers({ files, recordRoot });
+  const nextFiles = { ...previous.files };
+  for (const [path, text] of files) {
+    const body = projected.files.get(path);
+    if (body != null && inIntentRecord(path, recordRoot) && sha256(body) === sha256(text)) {
+      nextFiles[path] = sha256(text);
+    }
+  }
+  const stageRows = after.stageRows ?? [];
+  return {
+    schemaVersion: SYNC_BASELINE_VERSION,
+    intentId: current.intent.intentId,
+    headSha: headSha ?? null,
+    syncedAt: now,
+    files: Object.fromEntries(
+      Object.entries(nextFiles).toSorted(([left], [right]) => left.localeCompare(right)),
+    ),
+    stages: Object.fromEntries(
+      projected.stages.map((stage) => [
+        stage.stageId,
+        {
+          marker:
+            incoming.get(stage.stageId) === stage.marker && !conflictedStageIds.has(stage.stageId)
+              ? stage.marker
+              : (previous.stages[stage.stageId]?.marker ?? stage.marker),
+          // The UI's own stage row at this sync. A stage the UI starts later
+          // has a different row, which is how a sync tells it was started.
+          uiRow: rowSignature(stageRowFor(stageRows, stage.stageId)),
+        },
+      ]),
+    ),
+  };
+};
+
+// The first baseline, written when an intent is linked by a strict import
+// (`plan` from planReattach, `current` as it was before that import). The
+// strict import proved the UI still equals the export, so the export is the
+// ancestor and the imported state is what both sides agree on.
+const createSyncBaseline = ({ files: rawFiles, current, plan, headSha = null, now }) => {
+  const { files, manifest, projected } = openWorkspace({ rawFiles, current });
+  const recordRoot = recordRootFor(manifest);
+  const previous = {
+    files: Object.fromEntries(
+      manifest.files
+        .filter((entry) => inIntentRecord(entry.path, recordRoot))
+        .map((entry) => [entry.path, entry.sha256]),
+    ),
+    stages: Object.fromEntries(
+      projected.stages.map((stage) => [stage.stageId, { marker: stage.marker }]),
+    ),
+  };
+  return advanceSyncBaseline({ previous, files, current, manifest, plan, headSha, now });
+};
+
+const planSync = ({
+  files: rawFiles,
+  current,
+  baseline,
+  headSha = null,
+  now = new Date().toISOString(),
+}) => {
+  const { files, manifest, projected } = openWorkspace({ rawFiles, current });
+  assertSyncBaseline({ baseline, current });
+
+  const recordRoot = recordRootFor(manifest);
+  const {
+    baseMarker,
+    newlyCompleted,
+    conflicts: stageConflicts,
+    continuation,
+  } = compareSyncMarkers({
+    stages: current.stages,
+    stageRows: current.stageRows ?? [],
+    projectedStages: projected.stages,
+    baseline,
+    incoming: readStateMarkers({ files, recordRoot }),
+  });
+  const conflictedStageIds = new Set(stageConflicts.map((conflict) => conflict.stageId));
+  const planner = createImportPlanner({
+    files,
+    current,
+    manifest,
+    projected,
+    recordRoot,
+    baseMarker,
+    newlyCompleted,
+    conflictedStageIds,
+    completedWhen: 'at the last sync',
+    now,
+  });
+
+  const exportedSha = new Map(manifest.files.map((entry) => [entry.path, entry.sha256]));
+  const artifactConflicts = [];
+  const uiOwnedFiles = [];
+  const paths = new Set([...files.keys(), ...projected.files.keys()]);
+  for (const path of [...paths].toSorted((left, right) => left.localeCompare(right))) {
+    if (path === 'export-manifest.json' || planner.isBookkeeping(path)) continue;
+    const text = files.get(path);
+    const cli = text == null ? null : sha256(text);
+    if (!inIntentRecord(path, recordRoot)) {
+      // Methodology, harness and space files: never imported, never compared.
+      if (cli !== null && cli !== exportedSha.get(path)) {
+        planner.ignore(
+          path,
+          exportedSha.has(path)
+            ? 'methodology and harness files are not imported'
+            : 'files outside the intent record are not imported',
         );
       }
-      gateResolutions.push({
-        humanTaskId: task.humanTaskId,
-        kind: task.kind,
-        stageId: stage.stageId,
+      continue;
+    }
+    const base = baseline.files[path] ?? null;
+    const body = projected.files.get(path);
+    const ui = body == null ? null : sha256(body);
+    // A file the branch does not have is not a CLI change: removals are not
+    // imported, and the CLI never commits the gitignored cursors.
+    const cliChanged = cli !== null && cli !== base;
+    const uiChanged = ui !== base;
+    if (!cliChanged) {
+      if (uiChanged) uiOwnedFiles.push(path);
+      continue;
+    }
+    if (!uiChanged) {
+      planner.importFile(path, text);
+      continue;
+    }
+    if (ui !== cli) {
+      artifactConflicts.push({
+        kind: 'artifact',
+        path,
+        stageId: planner.locate(path).location?.stageId ?? null,
       });
     }
   }
 
+  const plan = planner.finish({
+    continuation,
+    isRemoval: (path) => baseline.files[path] != null,
+  });
   return {
-    intentId,
-    exportedAt: manifest.exportedAt,
-    upstreamRef: manifest.native.upstreamRef,
-    harness: manifest.native.harness,
-    continuationStageId: continuation?.stageId ?? null,
-    workflowComplete: continuation === null,
-    stageCompletions,
-    artifactWrites,
-    answers,
-    gateResolutions,
-    ignoredFiles,
-    warnings,
+    ...plan,
+    conflicts: [...stageConflicts, ...artifactConflicts],
+    uiOwnedFiles,
+    baseline: advanceSyncBaseline({
+      previous: baseline,
+      files,
+      current,
+      manifest,
+      plan,
+      conflictedStageIds,
+      headSha,
+      now,
+    }),
   };
 };
 
@@ -641,6 +976,14 @@ const applyReattachPlan = (current, plan) => {
 // release and harness before they can build the `current` records.
 const readExportManifest = (files) => parseManifest(normalizeFiles(files));
 
-export { applyReattachPlan, parseAnswer, parseStageMarkers, planReattach, readExportManifest };
+export {
+  applyReattachPlan,
+  createSyncBaseline,
+  parseAnswer,
+  parseStageMarkers,
+  planReattach,
+  planSync,
+  readExportManifest,
+};
 
 export default { planReattach, applyReattachPlan };

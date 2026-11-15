@@ -1341,6 +1341,14 @@ resource "aws_api_gateway_resource" "intent_import_upload" {
   path_part   = "upload"
 }
 
+# Stop syncing CLI progress from the branch linked by an import with Keep
+# syncing.
+resource "aws_api_gateway_resource" "intent_cli_sync" {
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  parent_id   = aws_api_gateway_resource.intent.id
+  path_part   = "cli-sync"
+}
+
 # Aggregated process/graph-read evidence (reads ledger, enrichment spend,
 # sensor findings) — the intent Audit view.
 resource "aws_api_gateway_resource" "intent_audit" {
@@ -1600,6 +1608,7 @@ locals {
     export_post            = { resource = aws_api_gateway_resource.intent_export.id, method = "POST" }
     import_post            = { resource = aws_api_gateway_resource.intent_import.id, method = "POST" }
     import_upload_post     = { resource = aws_api_gateway_resource.intent_import_upload.id, method = "POST" }
+    cli_sync_delete        = { resource = aws_api_gateway_resource.intent_cli_sync.id, method = "DELETE" }
     audit_get              = { resource = aws_api_gateway_resource.intent_audit.id, method = "GET" }
     derive_post            = { resource = aws_api_gateway_resource.intent_derive.id, method = "POST" }
     outputs_get            = { resource = aws_api_gateway_resource.intent_outputs.id, method = "GET" }
@@ -1681,6 +1690,12 @@ module "cors_intent_import_upload" {
   source      = "./cors"
   rest_api_id = aws_api_gateway_rest_api.main.id
   resource_id = aws_api_gateway_resource.intent_import_upload.id
+}
+
+module "cors_intent_cli_sync" {
+  source      = "./cors"
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  resource_id = aws_api_gateway_resource.intent_cli_sync.id
 }
 
 module "cors_intent_attachments" {

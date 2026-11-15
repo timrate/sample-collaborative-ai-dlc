@@ -234,6 +234,7 @@ const deleteIntentCascade = async ({
     purgeAttachmentPrefix(artifactsBucket, `intent-attachments/staging/${intentId}/`),
     purgeAttachmentPrefix(artifactsBucket, `workflow-exports/${intentId}/`),
     purgeAttachmentPrefix(artifactsBucket, `workflow-imports/${intentId}/`),
+    purgeAttachmentPrefix(artifactsBucket, `workflow-sync/${intentId}/`),
   ]);
 
   // Retire anything that could still wake up (same mechanics as cancel), then

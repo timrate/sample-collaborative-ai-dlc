@@ -164,11 +164,25 @@ import {
 } from './native-export.js';
 import {
   createImportUpload,
+  deleteSyncBaseline,
+  hasRecordChanges,
   importPreview,
   loadImportUpload,
+  loadSyncBaseline,
+  resolvePlanClock,
+  sourceControlGitProvider,
+  storeSyncBaseline,
+  validateBranchSource,
   writeImportedRecords,
 } from './native-import.js';
-import { planReattach, readExportManifest } from '../shared/native-workspace-importer.js';
+import {
+  createSyncBaseline,
+  planReattach,
+  planSync,
+  readExportManifest,
+} from '../shared/native-workspace-importer.js';
+import { readWorkspaceBranch } from '../shared/native-workspace-source.js';
+import { canonicalRepo } from '../shared/source-control-bindings.js';
 import { createGraphWriter } from '../shared/mcp/graph-writer.js';
 import {
   ATTACHMENT_UPLOAD_TTL_SECONDS,
@@ -1476,6 +1490,19 @@ const mapIntent = (meta) => ({
   // Set after a CLI re-attach import until the intent is continued (rewound)
   // at `stageId`; the frontend renders the Continue action off this.
   importedContinuation: meta.importedContinuation ?? null,
+  // The branch this intent syncs CLI progress from; the baseline id stays
+  // server-side.
+  cliSync: meta.cliSync
+    ? {
+        repo: meta.cliSync.repo,
+        provider: meta.cliSync.provider,
+        branch: meta.cliSync.branch,
+        linkedBy: meta.cliSync.linkedBy,
+        linkedAt: meta.cliSync.linkedAt,
+        lastSyncedSha: meta.cliSync.lastSyncedSha ?? null,
+        lastSyncedAt: meta.cliSync.lastSyncedAt ?? null,
+      }
+    : null,
   agentCli: meta.agentCli ?? null,
   credentialSource: meta.credentialBinding?.source ?? null,
   credentialConnection:
@@ -2309,6 +2336,7 @@ const NATIVE_IMPORT_STATUSES = new Set(['WAITING', 'FAILED', 'CANCELLED']);
 // different route.
 const INTENT_IMPORT_PATH = /\/intents\/[^/]+\/import$/;
 const INTENT_IMPORT_UPLOAD_PATH = /\/intents\/[^/]+\/import\/upload$/;
+const INTENT_CLI_SYNC_PATH = /\/intents\/[^/]+\/cli-sync$/;
 const NATIVE_IMPORT_ERROR_STATUS = {
   import_upload_invalid: 400,
   import_bundle_invalid: 400,
@@ -2316,6 +2344,9 @@ const NATIVE_IMPORT_ERROR_STATUS = {
   import_manifest_invalid: 400,
   import_upload_missing: 404,
   import_bundle_too_large: 413,
+  import_source_invalid: 400,
+  import_source_missing: 404,
+  import_source_unavailable: 502,
 };
 
 const importErrorResponse = (error, response) => {
@@ -2414,37 +2445,141 @@ const loadImportProjection = async ({ g, projectId, intentId, meta, manifest }) 
   return { ...aligned, upstreamRef };
 };
 
-// POST /projects/{projectId}/intents/{intentId}/import
-// Re-attach CLI progress to an intent this platform exported. `dryRun: true`
-// returns the preview and its planToken; a confirm repeats the request with
-// that planToken. The run is retired and the intent parks FAILED with
-// META.importedContinuation; Continue is a rewind to that stage.
-const handleImportIntent = async ({ event, body, projectId, intentId, g, response }) => {
-  const { meta, res } = await importableIntent(event, projectId, intentId, response);
-  if (res) return res;
-  const data = body ? JSON.parse(body) : {};
-  let plan;
+const sameLinkedBranch = (link, source) => {
+  if (!link || link.provider !== source.provider || link.branch !== source.branch) return false;
   try {
+    return (
+      canonicalRepo(source.provider, link.repo) === canonicalRepo(source.provider, source.repo)
+    );
+  } catch {
+    return false;
+  }
+};
+
+// Where the workspace comes from: an upload, or a repository branch read on
+// the backend. Returns the files, the plan clock and, for a branch, its head.
+const loadImportSource = async ({ data, projectId, intentId, link }) => {
+  if (data.source == null) {
     const { files, uploadedAt } = await loadImportUpload({
       s3,
       bucket: ARTIFACTS_BUCKET(),
       intentId,
       uploadId: data.uploadId,
     });
-    const manifest = readExportManifest(files);
+    return { files, now: uploadedAt, source: null, headSha: null };
+  }
+  const source = validateBranchSource(data.source);
+  const now = resolvePlanClock({ dryRun: data.dryRun === true, plannedAt: data.plannedAt });
+  const read = await readWorkspaceBranch({
+    provider: sourceControlGitProvider({
+      operate: sourceControlOperation,
+      projectId,
+      provider: source.provider,
+      repo: source.repo,
+    }),
+    ctx: null,
+    repoId: source.repo,
+    branch: source.branch,
+    knownHeadSha: link?.lastSyncedSha ?? null,
+  });
+  return { files: read.files, now, source, headSha: read.headSha, unchanged: read.unchanged };
+};
+
+// POST /projects/{projectId}/intents/{intentId}/import
+// Re-attach CLI progress to an intent this platform exported. `dryRun: true`
+// returns the preview and its planToken; a confirm repeats the request with
+// that planToken (and, for a branch source, the preview's plannedAt). The run
+// is retired and the intent parks FAILED with META.importedContinuation;
+// Continue is a rewind to that stage.
+//
+// Continuous sync (docs/fork-plan/cli-progress-sync-design.md): a branch
+// import with `keepSyncing: true` links the intent to that branch and stores
+// the first baseline. While linked, imports come only from the linked branch
+// and are three-way plans against the stored baseline (planSync): progress
+// made in the UI since then is kept, and a stage or artifact changed on both
+// sides is a conflict that blocks the import.
+const handleImportIntent = async ({ event, body, projectId, intentId, g, response }) => {
+  const { meta, res } = await importableIntent(event, projectId, intentId, response);
+  if (res) return res;
+  const data = body ? JSON.parse(body) : {};
+  const link = meta.cliSync ?? null;
+  const keepSyncing = data.keepSyncing === true;
+  if (keepSyncing && (data.source == null || link)) {
+    return response(400, {
+      error: link
+        ? 'This intent already syncs from a branch.'
+        : 'Keep syncing needs a repository branch as the source.',
+      code: 'import_sync_invalid',
+    });
+  }
+  let plan;
+  let loaded;
+  let baseline = null;
+  try {
+    if (link && !(data.source && sameLinkedBranch(link, validateBranchSource(data.source)))) {
+      return response(409, {
+        error: `This intent syncs CLI progress from ${link.repo}@${link.branch}. Import from that branch, or unlink it first.`,
+        code: 'import_sync_linked',
+      });
+    }
+    loaded = await loadImportSource({ data, projectId, intentId, link });
+    if (loaded.unchanged) {
+      return response(200, {
+        dryRun: data.dryRun === true,
+        unchanged: true,
+        headSha: loaded.headSha,
+      });
+    }
+    const manifest = readExportManifest(loaded.files);
     const current = await loadImportProjection({ g, projectId, intentId, meta, manifest });
-    plan = planReattach({ files, current, now: uploadedAt ?? manifest.exportedAt });
+    const now = loaded.now ?? manifest.exportedAt;
+    if (link) {
+      baseline = await loadSyncBaseline({
+        s3,
+        bucket: ARTIFACTS_BUCKET(),
+        intentId,
+        baselineId: link.baselineId,
+      });
+      plan = planSync({ files: loaded.files, current, baseline, headSha: loaded.headSha, now });
+    } else {
+      plan = planReattach({ files: loaded.files, current, now });
+      if (keepSyncing) {
+        plan.syncBaseline = createSyncBaseline({
+          files: loaded.files,
+          current,
+          plan,
+          headSha: loaded.headSha,
+          now,
+        });
+      }
+    }
   } catch (error) {
     const mapped = importErrorResponse(error, response);
     if (mapped) return mapped;
     throw error;
   }
-  const preview = importPreview(plan);
+  const binding = loaded.source
+    ? { headSha: loaded.headSha, plannedAt: loaded.now, keepSyncing }
+    : {};
+  const preview = {
+    ...importPreview(plan, binding),
+    ...(loaded.source
+      ? { headSha: loaded.headSha, plannedAt: loaded.now, sync: Boolean(link), keepSyncing }
+      : {}),
+  };
   if (data.dryRun === true) return response(200, { dryRun: true, ...preview });
   if (data.planToken !== preview.planToken) {
     return response(409, {
       error: 'The workspace or the intent changed since the preview. Review the import again.',
       code: 'import_plan_changed',
+    });
+  }
+  if (plan.conflicts?.length > 0) {
+    return response(409, {
+      error:
+        'The CLI and the UI both changed the same stage or artifact since the last sync. Nothing was imported.',
+      code: 'import_sync_conflict',
+      conflicts: plan.conflicts,
     });
   }
   if (plan.workflowComplete) {
@@ -2457,8 +2592,66 @@ const handleImportIntent = async ({ event, body, projectId, intentId, g, respons
 
   const responder = getResponder(event);
   const actor = responder.displayName || responder.sub;
-  const importId = `import-${randomUUID()}`;
   const importedAt = new Date().toISOString();
+  const nextBaseline = link ? plan.baseline : (plan.syncBaseline ?? null);
+  const nextLink = (baselineId) =>
+    nextBaseline
+      ? {
+          repo: link?.repo ?? loaded.source.repo,
+          provider: link?.provider ?? loaded.source.provider,
+          branch: link?.branch ?? loaded.source.branch,
+          linkedBy: link?.linkedBy ?? responder.sub,
+          linkedAt: link?.linkedAt ?? importedAt,
+          baselineId,
+          lastSyncedSha: loaded.headSha,
+          lastSyncedAt: importedAt,
+        }
+      : undefined;
+  // Written before anything refers to it; META switches to it last.
+  const baselineId = nextBaseline
+    ? await storeSyncBaseline({
+        s3,
+        bucket: ARTIFACTS_BUCKET(),
+        intentId,
+        baseline: nextBaseline,
+      })
+    : null;
+
+  // A link or sync that brings no records only stores the baseline. The run
+  // is not touched: there is nothing new to continue from.
+  if (nextBaseline && !hasRecordChanges(plan)) {
+    try {
+      const updated = await store.updateExecution({
+        executionId: intentId,
+        cliSync: nextLink(baselineId),
+        ifOrchestratorRunId: meta.orchestratorRunId,
+      });
+      if (link) {
+        await deleteSyncBaseline({
+          s3,
+          bucket: ARTIFACTS_BUCKET(),
+          intentId,
+          baselineId: link.baselineId,
+        });
+      }
+      return response(200, {
+        synced: true,
+        ...preview,
+        intent: mapIntent({ ...meta, ...updated }),
+      });
+    } catch (error) {
+      await deleteSyncBaseline({ s3, bucket: ARTIFACTS_BUCKET(), intentId, baselineId });
+      if (error?.name === 'ConditionalCheckFailedException') {
+        return response(409, {
+          error: 'The intent changed while the sync ran. Review the import again.',
+          code: 'execution_changed',
+        });
+      }
+      throw error;
+    }
+  }
+
+  const importId = `import-${randomUUID()}`;
   // Take the run away from any orchestrator first, as rewind does: a woken
   // run no longer owns the execution and exits quietly.
   try {
@@ -2476,6 +2669,7 @@ const handleImportIntent = async ({ event, body, projectId, intentId, g, respons
       orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
     });
   } catch (error) {
+    await deleteSyncBaseline({ s3, bucket: ARTIFACTS_BUCKET(), intentId, baselineId });
     if (error?.name === 'ConditionalCheckFailedException') {
       return response(409, {
         error: 'The intent changed while the import started. Review the import again.',
@@ -2515,13 +2709,23 @@ const handleImportIntent = async ({ event, body, projectId, intentId, g, respons
       executionId: intentId,
       failureReason: 'imported_from_cli',
       importedContinuation: { importId, stageId: plan.continuationStageId, importedAt },
+      ...(nextBaseline ? { cliSync: nextLink(baselineId) } : {}),
     });
+    if (link) {
+      await deleteSyncBaseline({
+        s3,
+        bucket: ARTIFACTS_BUCKET(),
+        intentId,
+        baselineId: link.baselineId,
+      });
+    }
+    const source = loaded.source ? ` from ${loaded.source.repo}@${loaded.source.branch}` : '';
     await store
       .appendEvent({
         executionId: intentId,
-        type: 'v2.execution.imported',
+        type: link ? 'v2.cli.synced' : 'v2.execution.imported',
         actor,
-        summary: `${actor} imported CLI progress (${plan.stageCompletions.length} stage(s), ${plan.artifactWrites.length} artifact(s)); continue at ${plan.continuationStageId}`,
+        summary: `${actor} ${link ? 'synced' : 'imported'} CLI progress${source} (${plan.stageCompletions.length} stage(s), ${plan.artifactWrites.length} artifact(s)); continue at ${plan.continuationStageId}${keepSyncing ? '; keeps syncing from this branch' : ''}`,
       })
       .catch((err) => logger.error('Import event append failed', err));
     return response(201, {
@@ -2549,6 +2753,39 @@ const handleImportIntent = async ({ event, body, projectId, intentId, g, respons
       code: 'import_failed',
     });
   }
+};
+
+// DELETE /projects/{projectId}/intents/{intentId}/cli-sync — stop syncing CLI
+// progress from the linked branch. Any project member may unlink, as for
+// import. Idempotent; the baseline object is removed best effort.
+const handleUnlinkCliSync = async ({ event, projectId, intentId, response }) => {
+  const meta = await store.getExecution(intentId, { consistentRead: true });
+  if (!meta || meta.projectId !== projectId) return response(404, { error: 'Intent not found' });
+  const denied = validationIntentDenied(event, meta, response);
+  if (denied) return denied;
+  const link = meta.cliSync ?? null;
+  if (!link) return response(200, { unlinked: false, intent: mapIntent(meta) });
+  const updated = await store.updateExecution({ executionId: intentId, cliSync: null });
+  await deleteSyncBaseline({
+    s3,
+    bucket: ARTIFACTS_BUCKET(),
+    intentId,
+    baselineId: link.baselineId,
+  });
+  const responder = getResponder(event);
+  const actor = responder.displayName || responder.sub;
+  await store
+    .appendEvent({
+      executionId: intentId,
+      type: 'v2.cli.unlinked',
+      actor,
+      summary: `${actor} stopped syncing CLI progress from ${link.repo}@${link.branch}`,
+    })
+    .catch((err) => logger.error('Unlink event append failed', err));
+  return response(200, {
+    unlinked: true,
+    intent: mapIntent({ ...meta, ...updated, cliSync: undefined }),
+  });
 };
 
 // POST /projects/{projectId}/intents/{intentId}/realtime-token
@@ -7033,6 +7270,10 @@ export const handler = async (event, context) => {
 
     if (intentId && httpMethod === 'POST' && INTENT_IMPORT_PATH.test(path ?? '')) {
       return await handleImportIntent({ event, body, projectId, intentId, g, response });
+    }
+
+    if (intentId && httpMethod === 'DELETE' && INTENT_CLI_SYNC_PATH.test(path ?? '')) {
+      return await handleUnlinkCliSync({ event, projectId, intentId, response });
     }
 
     if (intentId && httpMethod === 'POST' && path?.endsWith('/realtime-token')) {

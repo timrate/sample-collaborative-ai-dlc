@@ -40,6 +40,7 @@ const SOURCE_CONTROL_OPERATIONS = Object.freeze({
   tree: 'read',
   contents: 'read',
   'default-branch': 'read',
+  'branch-head': 'read',
   compare: 'read',
   'find-pr': 'read',
   'create-pr': 'write',
@@ -311,6 +312,8 @@ const callProvider = async (provider, operation, ctx, repo, args = {}) => {
       return provider.getFileContents(ctx, repo, args.path, args.branch);
     case 'default-branch':
       return provider.getDefaultBranch(ctx, repo);
+    case 'branch-head':
+      return provider.getBranchHead(ctx, repo, args.branch);
     case 'compare':
       return provider.compareBranches(ctx, repo, { base: args.base, head: args.head });
     case 'find-pr':

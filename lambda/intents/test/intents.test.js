@@ -2671,6 +2671,299 @@ describe('POST /projects/{id}/intents/{intentId}/import (CLI re-attach)', () => 
     expect(res.statusCode, res.body).toBe(202);
     expect(procStore.get(keyOf(`EXEC#${intentId}`, 'META')).importedContinuation).toBeUndefined();
   });
+
+  // --- Continuous sync (docs/fork-plan/cli-progress-sync-design.md) ---------
+
+  const BRANCH = { provider: 'github', repo: 'acme/workspace', branch: 'cli-work' };
+  const HEAD_1 = 'a'.repeat(40);
+
+  // The workspace repository branch, served by the source-control service the
+  // way the project binding would read it.
+  const serveBranch = (files, headSha = HEAD_1) => {
+    const branch = { files: new Map(files), headSha, operations: [] };
+    sourceControlOperationHandler = (request) => {
+      branch.operations.push(request.operation);
+      expect(request).toMatchObject({
+        action: 'operate',
+        provider: BRANCH.provider,
+        repo: BRANCH.repo,
+      });
+      if (request.operation === 'branch-head') return branch.headSha;
+      expect(request.args.branch).toBe(BRANCH.branch);
+      if (request.operation === 'tree') {
+        return [...branch.files].map(([path, content]) => ({
+          path,
+          size: Buffer.byteLength(content),
+        }));
+      }
+      if (request.operation === 'contents') {
+        return { path: request.args.path, content: branch.files.get(request.args.path) };
+      }
+      throw new Error(`unexpected operation ${request.operation}`);
+    };
+    return branch;
+  };
+
+  // Baselines go to S3; keep them where the GetObject fake reads uploads.
+  const keepS3Writes = (uploads) =>
+    s3Mock.on(PutObjectCommand).callsFake((input) => {
+      uploads.set(input.Key, Buffer.from(input.Body));
+      return {};
+    });
+
+  const fromBranch = async (sub, projectId, intentId, extra = {}) => {
+    const preview = await call(sub, projectId, intentId, 'import', {
+      source: BRANCH,
+      dryRun: true,
+      ...extra,
+    });
+    expect(preview.statusCode, preview.body).toBe(200);
+    const body = JSON.parse(preview.body);
+    if (body.unchanged) return { preview: body, confirm: null };
+    const confirm = await call(sub, projectId, intentId, 'import', {
+      source: BRANCH,
+      planToken: body.planToken,
+      plannedAt: body.plannedAt,
+      ...extra,
+    });
+    return { preview: body, confirm };
+  };
+
+  const linked = async () => {
+    const context = await setup();
+    const { sub, projectId, intentId, uploads } = context;
+    keepS3Writes(uploads);
+    const cli = advanceInCli(await exportFiles(sub, projectId, intentId));
+    const branch = serveBranch(cli);
+    const { confirm } = await fromBranch(sub, projectId, intentId, { keepSyncing: true });
+    expect(confirm.statusCode, confirm.body).toBe(201);
+    return { ...context, cli, branch, linkResult: JSON.parse(confirm.body) };
+  };
+
+  const meta = (intentId) => procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+  const pathEnding = (files, suffix) => [...files.keys()].find((key) => key.endsWith(suffix));
+
+  const unlink = (sub, projectId, intentId) =>
+    handler({
+      httpMethod: 'DELETE',
+      path: `/projects/${projectId}/intents/${intentId}/cli-sync`,
+      pathParameters: { projectId, intentId },
+      ...claims(sub),
+    });
+
+  it('reads a branch on the backend, links it, and stores the first baseline', async () => {
+    const { sub, intentId, uploads, branch, linkResult } = await linked();
+
+    expect(branch.operations.filter((operation) => operation === 'branch-head')).toHaveLength(4);
+    const link = meta(intentId).cliSync;
+    expect(link).toMatchObject({
+      ...BRANCH,
+      linkedBy: sub,
+      lastSyncedSha: HEAD_1,
+      baselineId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    });
+    expect(meta(intentId)).toMatchObject({
+      status: 'FAILED',
+      importedContinuation: expect.objectContaining({ stageId: 'workflow-planning' }),
+    });
+    const stored = JSON.parse(
+      uploads.get(`workflow-sync/${intentId}/${link.baselineId}.json`).toString('utf8'),
+    );
+    expect(stored).toMatchObject({ schemaVersion: 1, intentId, headSha: HEAD_1 });
+    expect(stored.stages['requirements-analysis'].marker).toBe('x');
+    // The baseline id stays server-side.
+    expect(linkResult.intent.cliSync).toEqual({
+      ...BRANCH,
+      linkedBy: sub,
+      linkedAt: link.linkedAt,
+      lastSyncedSha: HEAD_1,
+      lastSyncedAt: link.lastSyncedAt,
+    });
+  });
+
+  it('links a branch with no new progress without retiring the parked run', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    keepS3Writes(uploads);
+    serveBranch(await exportFiles(sub, projectId, intentId));
+
+    const { preview, confirm } = await fromBranch(sub, projectId, intentId, { keepSyncing: true });
+    expect(preview.stageCompletions).toEqual([]);
+    expect(confirm.statusCode, confirm.body).toBe(200);
+    expect(JSON.parse(confirm.body).synced).toBe(true);
+    expect(meta(intentId)).toMatchObject({
+      status: 'WAITING',
+      orchestratorRunId: 'run-1',
+      cliSync: expect.objectContaining({ ...BRANCH, lastSyncedSha: HEAD_1 }),
+    });
+    expect(meta(intentId).importedContinuation).toBeUndefined();
+  });
+
+  it('stops at the branch head when nothing was pushed since the last sync', async () => {
+    const { sub, projectId, intentId, branch } = await linked();
+    branch.operations.length = 0;
+
+    const { preview } = await fromBranch(sub, projectId, intentId);
+    expect(preview).toEqual({ dryRun: true, unchanged: true, headSha: HEAD_1 });
+    expect(branch.operations).toEqual(['branch-head']);
+  });
+
+  it('advances the baseline without touching the run when a push brings no records', async () => {
+    const { sub, projectId, intentId, uploads, branch } = await linked();
+    const before = meta(intentId);
+    branch.headSha = 'c'.repeat(40);
+
+    const { preview, confirm } = await fromBranch(sub, projectId, intentId);
+    expect(preview).toMatchObject({ sync: true, stageCompletions: [], conflicts: [] });
+    expect(confirm.statusCode, confirm.body).toBe(200);
+    expect(JSON.parse(confirm.body).synced).toBe(true);
+
+    const after = meta(intentId);
+    expect(after.cliSync.lastSyncedSha).toBe('c'.repeat(40));
+    expect(after.cliSync.baselineId).not.toBe(before.cliSync.baselineId);
+    expect(after.cliSync.linkedAt).toBe(before.cliSync.linkedAt);
+    expect(uploads.has(`workflow-sync/${intentId}/${after.cliSync.baselineId}.json`)).toBe(true);
+    expect(after.orchestratorRunId).toBe(before.orchestratorRunId);
+    expect(after.importedContinuation).toEqual(before.importedContinuation);
+    expect(s3Mock.commandCalls(DeleteObjectCommand).map((c) => c.args[0].input.Key)).toContain(
+      `workflow-sync/${intentId}/${before.cliSync.baselineId}.json`,
+    );
+  });
+
+  it('plans later CLI progress against the baseline instead of the export', async () => {
+    const { sub, projectId, intentId, cli, branch } = await linked();
+    const state = pathEnding(cli, '/aidlc-state.md');
+    branch.files.set(
+      state,
+      cli.get(state).replace('- [-] workflow-planning', '- [x] workflow-planning'),
+    );
+    branch.headSha = 'b'.repeat(40);
+
+    const { preview, confirm } = await fromBranch(sub, projectId, intentId);
+    expect(preview).toMatchObject({
+      sync: true,
+      headSha: 'b'.repeat(40),
+      conflicts: [],
+      stageCompletions: [expect.objectContaining({ stageId: 'workflow-planning' })],
+      workflowComplete: true,
+    });
+    // Planning was the last stage, so there is nothing to continue at.
+    expect(confirm.statusCode).toBe(409);
+    expect(JSON.parse(confirm.body).code).toBe('import_workflow_complete');
+  });
+
+  it('blocks an import when the UI and the CLI both changed an artifact', async () => {
+    const { sub, projectId, intentId, cli, branch } = await linked();
+    await g
+      .V()
+      .has('Artifact', 'id', 'requirements')
+      .has('intent_id', intentId)
+      .property(gremlin.process.cardinality.single, 'content', '# Requirements\n\nUI edit.\n')
+      .next();
+    const requirements = pathEnding(cli, '/requirements-analysis/requirements.md');
+    branch.files.set(requirements, '# Requirements\n\nCLI edit.\n');
+    branch.headSha = 'd'.repeat(40);
+    const before = meta(intentId);
+
+    const { preview, confirm } = await fromBranch(sub, projectId, intentId);
+    expect(preview.conflicts).toEqual([
+      { kind: 'artifact', path: requirements, stageId: 'requirements-analysis' },
+    ]);
+    expect(confirm.statusCode).toBe(409);
+    expect(JSON.parse(confirm.body)).toMatchObject({
+      code: 'import_sync_conflict',
+      conflicts: preview.conflicts,
+    });
+    expect(meta(intentId).cliSync).toEqual(before.cliSync);
+    expect(meta(intentId).orchestratorRunId).toBe(before.orchestratorRunId);
+  });
+
+  it('refuses other sources while linked, and Keep syncing without a branch', async () => {
+    const { sub, projectId, intentId, uploads, cli } = await linked();
+    upload(uploads, intentId, cli);
+
+    const fromUpload = await call(sub, projectId, intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      dryRun: true,
+    });
+    expect(fromUpload.statusCode).toBe(409);
+    expect(JSON.parse(fromUpload.body).code).toBe('import_sync_linked');
+
+    const otherBranch = await call(sub, projectId, intentId, 'import', {
+      source: { ...BRANCH, branch: 'other' },
+      dryRun: true,
+    });
+    expect(otherBranch.statusCode).toBe(409);
+    expect(JSON.parse(otherBranch.body).code).toBe('import_sync_linked');
+
+    const relink = await call(sub, projectId, intentId, 'import', {
+      source: BRANCH,
+      keepSyncing: true,
+      dryRun: true,
+    });
+    expect(relink.statusCode).toBe(400);
+    expect(JSON.parse(relink.body).code).toBe('import_sync_invalid');
+
+    const fresh = await setup();
+    const zipLink = await call(fresh.sub, fresh.projectId, fresh.intentId, 'import', {
+      uploadId: UPLOAD_ID,
+      keepSyncing: true,
+      dryRun: true,
+    });
+    expect(zipLink.statusCode).toBe(400);
+    expect(JSON.parse(zipLink.body).code).toBe('import_sync_invalid');
+  });
+
+  it('refuses a branch confirm whose preview has expired', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    keepS3Writes(uploads);
+    serveBranch(advanceInCli(await exportFiles(sub, projectId, intentId)));
+    const preview = JSON.parse(
+      (await call(sub, projectId, intentId, 'import', { source: BRANCH, dryRun: true })).body,
+    );
+
+    const confirm = await call(sub, projectId, intentId, 'import', {
+      source: BRANCH,
+      planToken: preview.planToken,
+      plannedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    });
+    expect(confirm.statusCode).toBe(409);
+    expect(JSON.parse(confirm.body).code).toBe('import_plan_changed');
+    expect(meta(intentId).status).toBe('WAITING');
+  });
+
+  it('reports a branch the source-control service cannot read', async () => {
+    const { sub, projectId, intentId } = await setup();
+    sourceControlOperationHandler = () => {
+      throw Object.assign(new Error('nope'), { code: 'REPOSITORY_NOT_ON_PROJECT' });
+    };
+    const res = await call(sub, projectId, intentId, 'import', { source: BRANCH, dryRun: true });
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).code).toBe('import_source_unavailable');
+  });
+
+  it('unlinks the branch and removes its baseline; unlinking again is a no-op', async () => {
+    const { sub, projectId, intentId } = await linked();
+    const { baselineId } = meta(intentId).cliSync;
+
+    const res = await unlink(sub, projectId, intentId);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ unlinked: true, intent: { cliSync: null } });
+    expect(meta(intentId).cliSync).toBeUndefined();
+    expect(s3Mock.commandCalls(DeleteObjectCommand).map((c) => c.args[0].input.Key)).toContain(
+      `workflow-sync/${intentId}/${baselineId}.json`,
+    );
+
+    const again = await unlink(sub, projectId, intentId);
+    expect(again.statusCode).toBe(200);
+    expect(JSON.parse(again.body).unlinked).toBe(false);
+  });
+
+  it('denies unlinking to a user who is not a member of the project', async () => {
+    const { projectId, intentId } = await linked();
+    const res = await unlink(`u-${randomUUID()}`, projectId, intentId);
+    expect(res.statusCode).toBe(403);
+    expect(meta(intentId).cliSync).toBeDefined();
+  });
 });
 
 describe('unit PR review feedback', () => {
@@ -6740,6 +7033,32 @@ describe('DELETE /projects/{id}/intents/{intentId}', () => {
       deletes.find((input) => input.Delete.Objects.some((o) => o.Key.startsWith(importPrefix)))
         ?.Delete.Objects,
     ).toEqual(importVersions);
+  });
+
+  it('purges every version of the intent CLI sync baselines from S3', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intentId = JSON.parse((await createIntent(sub, projectId)).body).id;
+    await seedIntentAnchor(intentId);
+    setStatus(intentId, { status: 'SUCCEEDED' });
+
+    const syncPrefix = `workflow-sync/${intentId}/`;
+    const syncVersions = [
+      { Key: `${syncPrefix}b1.json`, VersionId: 'v1' },
+      { Key: `${syncPrefix}b2.json`, VersionId: 'v1' },
+    ];
+    s3Mock
+      .on(ListObjectVersionsCommand)
+      .callsFake((input) => (input.Prefix === syncPrefix ? { Versions: syncVersions } : {}));
+    s3Mock.on(DeleteObjectsCommand).resolves({});
+
+    expect((await del(sub, projectId, intentId)).statusCode).toBe(204);
+
+    const deletes = s3Mock.commandCalls(DeleteObjectsCommand).map((call) => call.args[0].input);
+    expect(
+      deletes.find((input) => input.Delete.Objects.some((o) => o.Key.startsWith(syncPrefix)))
+        ?.Delete.Objects,
+    ).toEqual(syncVersions);
   });
 
   it('cascade sweeps the derived layer AND spares a sibling intent that shares an artifact id', async () => {

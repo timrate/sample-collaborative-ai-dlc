@@ -1,9 +1,9 @@
 // Re-attach import of a native AI-DLC workspace (the inverse of native-export).
 //
-// The workspace arrives as one S3 object uploaded through a presigned POST:
-//  - the export ZIP itself, after the CLI advanced it; or
-//  - a JSON file bundle the frontend assembles from a workspace repository
-//    branch through the project source-control API.
+// The workspace arrives either as one S3 object uploaded through a presigned
+// POST (the export ZIP itself, after the CLI advanced it, or a JSON file
+// bundle), or as a workspace repository branch the handler reads through the
+// project source-control service (readWorkspaceBranch).
 // Only the files the importer reads are kept (`export-manifest.json`,
 // `aidlc/**`, `aidlc-docs/**`); harness and code-repository entries are
 // skipped without being decompressed.
@@ -14,15 +14,13 @@
 // retired the parked run.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import yauzl from 'yauzl';
+import { createBundleBudget, isImportedPath } from '../shared/native-workspace-source.js';
 import { bodyToBuffer } from './native-export.js';
 
 const IMPORT_MAX_BYTES = 100 * 1024 * 1024;
-const IMPORT_MAX_FILES = 5000;
-const IMPORT_MAX_FILE_BYTES = 5 * 1024 * 1024;
-const IMPORT_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const UPLOAD_TTL_SECONDS = 15 * 60;
 const IMPORT_EDIT_ORIGIN = 'cli-import';
 const UPLOAD_CONTENT_TYPES = { zip: 'application/zip', json: 'application/json' };
@@ -33,30 +31,7 @@ const importError = (code, message) =>
 
 const sha256 = (body) => createHash('sha256').update(body).digest('hex');
 
-const isImportedPath = (path) =>
-  path === 'export-manifest.json' || path.startsWith('aidlc/') || path.startsWith('aidlc-docs/');
-
 const importUploadKey = (intentId, uploadId) => `workflow-imports/${intentId}/${uploadId}`;
-
-// Size limits apply to the kept entries only; a ZIP's harness and code-repo
-// entries are skipped by name before anything is inflated.
-const createBundleBudget = () => {
-  let files = 0;
-  let bytes = 0;
-  return (path, size) => {
-    files += 1;
-    bytes += size;
-    if (size > IMPORT_MAX_FILE_BYTES) {
-      throw importError('import_bundle_too_large', `${path} exceeds the 5 MB per-file limit`);
-    }
-    if (files > IMPORT_MAX_FILES || bytes > IMPORT_MAX_TOTAL_BYTES) {
-      throw importError(
-        'import_bundle_too_large',
-        'the workspace record exceeds the import limits (5000 files, 50 MB)',
-      );
-    }
-  };
-};
 
 const readZipBundle = (buffer) =>
   new Promise((resolve, reject) => {
@@ -203,7 +178,9 @@ const loadImportUpload = async ({ s3, bucket, intentId, uploadId }) => {
 // to the workspace or to the intent between preview and confirm changes it.
 // planReattach builds plans with a fixed key order and sorted file lists, so
 // plain JSON serialization is stable for equal plans.
-const importPlanToken = (plan) =>
+// `binding` carries what else the confirm must repeat: the branch commit and
+// whether the member asked to keep syncing.
+const importPlanToken = (plan, binding = {}) =>
   sha256(
     JSON.stringify({
       ...plan,
@@ -211,11 +188,20 @@ const importPlanToken = (plan) =>
         ...write,
         contentSha256: sha256(content),
       })),
+      ...(Object.keys(binding).length > 0 ? { binding } : {}),
     }),
   );
 
-const importPreview = (plan) => ({
-  planToken: importPlanToken(plan),
+const hasRecordChanges = (plan) =>
+  plan.stageCompletions.length > 0 ||
+  plan.artifactWrites.length > 0 ||
+  plan.answers.length > 0 ||
+  plan.gateResolutions.length > 0;
+
+const importPreview = (plan, binding = {}) => ({
+  planToken: importPlanToken(plan, binding),
+  // Sync plans only: conflicts block the import, UI-owned files are kept.
+  ...(plan.conflicts ? { conflicts: plan.conflicts, uiOwnedFiles: plan.uiOwnedFiles } : {}),
   continuationStageId: plan.continuationStageId,
   workflowComplete: plan.workflowComplete,
   stageCompletions: plan.stageCompletions.map(({ stageId, phase, completedAt }) => ({
@@ -235,6 +221,125 @@ const importPreview = (plan) => ({
   ignoredFiles: plan.ignoredFiles,
   warnings: plan.warnings,
 });
+
+// --- Branch source and continuous sync -------------------------------------
+// docs/fork-plan/cli-progress-sync-design.md. The intents Lambda reads a
+// workspace branch through the project source-control service, which checks
+// the repository is attached to the project and resolves the binding's own
+// read credential. No credential reaches this Lambda.
+
+const BRANCH_NAME_MAX = 255;
+
+const validateBranchSource = (source) => {
+  const provider = typeof source?.provider === 'string' ? source.provider : '';
+  const repo = typeof source?.repo === 'string' ? source.repo.trim() : '';
+  const branch = typeof source?.branch === 'string' ? source.branch.trim() : '';
+  if (
+    !['github', 'gitlab', 'bitbucket', 'codecommit'].includes(provider) ||
+    !repo ||
+    !branch ||
+    branch.length > BRANCH_NAME_MAX ||
+    branch.startsWith('-') ||
+    branch.split('/').some((part) => !part || part === '.' || part === '..')
+  ) {
+    throw importError('import_source_invalid', 'source needs a provider, repository and branch');
+  }
+  return { provider, repo, branch };
+};
+
+// A shared-git-provider shape over the source-control service, for
+// readWorkspaceBranch. Service failures arrive with an allowlisted code only.
+const sourceControlGitProvider = ({ operate, projectId, provider, repo }) => {
+  const call = async (operation, args) => {
+    try {
+      return await operate({ projectId, provider, repo, operation, args });
+    } catch (error) {
+      throw importError(
+        'import_source_unavailable',
+        `the branch could not be read (${error?.code || 'SOURCE_CONTROL_OPERATION_FAILED'})`,
+      );
+    }
+  };
+  return {
+    getBranchHead: (_ctx, _repo, branch) => call('branch-head', { branch }),
+    getTree: async (_ctx, _repo, branch) => {
+      const tree = await call('tree', { branch });
+      return Array.isArray(tree) ? tree : (tree?.tree ?? []);
+    },
+    getFileContents: (_ctx, _repo, path, branch) => call('contents', { path, branch }),
+  };
+};
+
+// A branch read carries no upload time, so the preview fixes the plan's clock
+// and the confirm repeats it; the plan token binds the two. A confirm may not
+// move the clock outside the preview window.
+const resolvePlanClock = ({ dryRun, plannedAt, now = Date.now() }) => {
+  if (dryRun) return new Date(now).toISOString();
+  const at = typeof plannedAt === 'string' ? Date.parse(plannedAt) : Number.NaN;
+  if (!Number.isFinite(at) || at > now + 60_000 || now - at > UPLOAD_TTL_SECONDS * 1000) {
+    throw importError(
+      'import_plan_changed',
+      'the preview has expired or is missing its plan time; review the import again',
+    );
+  }
+  return new Date(at).toISOString();
+};
+
+// One object per baseline, never overwritten: META.cliSync.baselineId names
+// the current one, so a sync writes the next baseline first and switches the
+// id in the same META update that records the import. A failure before that
+// switch leaves the previous baseline in effect. The prefix is outside
+// workflow-imports/, whose objects expire after a day.
+const syncBaselineKey = (intentId, baselineId) => `workflow-sync/${intentId}/${baselineId}.json`;
+
+const storeSyncBaseline = async ({ s3, bucket, intentId, baseline }) => {
+  const baselineId = randomUUID();
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: syncBaselineKey(intentId, baselineId),
+      Body: JSON.stringify(baseline),
+      ContentType: 'application/json',
+    }),
+  );
+  return baselineId;
+};
+
+const loadSyncBaseline = async ({ s3, bucket, intentId, baselineId }) => {
+  const invalid = () =>
+    importError(
+      'import_sync_baseline_invalid',
+      'the sync baseline for this intent is missing; unlink the branch and import again with Keep syncing',
+    );
+  if (typeof baselineId !== 'string' || !UUID_RE.test(baselineId)) throw invalid();
+  let result;
+  try {
+    result = await s3.send(
+      new GetObjectCommand({ Bucket: bucket, Key: syncBaselineKey(intentId, baselineId) }),
+    );
+  } catch (error) {
+    if (error?.name === 'NoSuchKey' || error?.$metadata?.httpStatusCode === 404) throw invalid();
+    throw error;
+  }
+  try {
+    return JSON.parse((await bodyToBuffer(result.Body)).toString('utf8'));
+  } catch {
+    throw invalid();
+  }
+};
+
+// Best effort: a baseline left behind is unreferenced and is purged with the
+// intent.
+const deleteSyncBaseline = async ({ s3, bucket, intentId, baselineId }) => {
+  if (typeof baselineId !== 'string' || !UUID_RE.test(baselineId)) return;
+  try {
+    await s3.send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: syncBaselineKey(intentId, baselineId) }),
+    );
+  } catch {
+    // Unreferenced; removed with the intent.
+  }
+};
 
 const importedArtifactId = (write) =>
   `imported-${sha256(`${write.stageId}\0${write.artifactType}`).slice(0, 16)}`;
@@ -344,10 +449,18 @@ export {
   IMPORT_MAX_BYTES,
   UPLOAD_TTL_SECONDS,
   createImportUpload,
+  deleteSyncBaseline,
+  hasRecordChanges,
   importPlanToken,
   importPreview,
   importUploadKey,
   loadImportUpload,
+  loadSyncBaseline,
   readImportBundle,
+  resolvePlanClock,
+  sourceControlGitProvider,
+  storeSyncBaseline,
+  syncBaselineKey,
+  validateBranchSource,
   writeImportedRecords,
 };
