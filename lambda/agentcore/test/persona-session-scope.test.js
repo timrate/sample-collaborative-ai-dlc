@@ -233,6 +233,7 @@ const harness = ({
       commits.push(args.message);
       return { ok: true, committed: false, results: [] };
     },
+    syncAllBranches: async () => ({ ok: true, changed: false, conflicted: false, results: [] }),
     ...(broadcast ? { broadcast } : {}),
   };
   return { deps, store, mcpScopes, commits };

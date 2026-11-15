@@ -74,6 +74,8 @@ describe('engineCommitMessage', () => {
     [{ kind: 'merge', unitSlug: 'auth' }, 'merge auth lane'],
     [{ kind: 'reconcile', unitSlug: 'auth' }, 'reconcile auth lane with the intent branch'],
     [{ kind: 'conflict-resolution', unitSlug: 'auth' }, 'resolve auth lane conflicts'],
+    [{ kind: 'sync', stageId: 'code-generation' }, 'merge changes pushed to the branch'],
+    [{ kind: 'sync', unitSlug: 'auth' }, 'merge changes pushed to the branch for auth'],
   ])('%j has the subject %s', (options, subject) => {
     expect(message(options).split('\n')[0]).toBe(`chore(aidlc): ${subject}`);
   });

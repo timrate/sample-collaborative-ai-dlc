@@ -36,6 +36,7 @@ describe('agent command registry', () => {
         'init-lane',
         'merge-lane',
         'reconcile-lane',
+        'sync-branch',
       ].toSorted(),
     );
   });

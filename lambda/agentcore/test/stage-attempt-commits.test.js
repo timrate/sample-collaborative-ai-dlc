@@ -129,6 +129,7 @@ const deps = (store, { lib, ...overrides }) => ({
   spawnFn: okSpawn,
   ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
   redirectHeavyDirs: async () => ({ links: [] }),
+  syncAllBranches: async () => ({ ok: true, changed: false, conflicted: false, results: [] }),
   ...overrides,
 });
 

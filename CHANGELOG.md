@@ -10,8 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Import CLI progress.** A project member can bring workflow progress made in a native AI-DLC harness back to the intent it was exported from, from the workspace ZIP or from a workspace repository branch. Sequential stages the CLI completed are recorded, with their artifacts (marked as imported) and question answers. The intent then waits to be continued at the next stage. The import shows a preview first, and refuses a workspace when the intent changed in the UI after the export. Construction unit progress is not imported yet. See [Importing CLI Progress](docs/using-the-platform/importing-cli-progress.md).
 
+- **Branch sync.** The engine now picks up pushes made to the branch an intent works on, for example by a person, the AI-DLC CLI or CI. Before each stage's agent starts and before each push, it fetches the branch, then fast-forwards or merges. A conflict fails the stage with `branch_sync_conflict` and publishes the intent's work to `<branch>--sync-conflict` for a person to merge. While a run waits for a person, **Intent actions → Sync branch now** runs the same sync on request. See [Changes pushed to the intent branch](docs/using-the-platform/git-integration.md#changes-pushed-to-the-intent-branch).
+
+### Changed
+
+- **Engine push after a remote change.** A stage whose branch moved on the remote during the stage used to fail with `push_failed`. The engine now merges and pushes. It fails with `branch_sync_conflict` only when the merge conflicts.
+
 ### Notes
 
+- **Deployment.** Branch sync adds the `POST /projects/{projectId}/intents/{intentId}/sync-branch` API route and the `sync-branch` runtime command. Deploy the agent runtime image and apply Terraform together. Until the new runtime image is deployed, the route fails because the runtime does not know the command. Stage behavior changes take effect with the runtime image alone.
 - **Deployment.** The import adds the `POST /projects/{projectId}/intents/{intentId}/import` and `/import/upload` API routes. It also adds intents Lambda access to the `workflow-imports/` prefix of the artifacts bucket, and a one-day expiry rule for that prefix. Apply Terraform before using it.
 
 ## [2.3.1] - 2026-11-13

@@ -85,6 +85,8 @@ const engineSubject = ({ kind, stageId, unitSlug, label }) => {
       return `reconcile ${unitSlug} lane with the intent branch`;
     case 'conflict-resolution':
       return `resolve ${unitSlug} lane conflicts`;
+    case 'sync':
+      return `merge changes pushed to the branch${unitSlug ? ` for ${unitSlug}` : ''}`;
     default: {
       const what = label ? String(label).replace(/^checkpoint\s+/, '') : 'stage';
       return `checkpoint ${stageId} ${what}${unitSlug ? ` for ${unitSlug}` : ''}`;
@@ -92,7 +94,8 @@ const engineSubject = ({ kind, stageId, unitSlug, label }) => {
   }
 };
 
-// kind: 'stage' (default), 'merge', 'reconcile' or 'conflict-resolution'.
+// kind: 'stage' (default), 'merge', 'reconcile', 'conflict-resolution' or
+// 'sync' (merging pushes made to the working branch outside the session).
 // phase: the stage's workflow phase. intent: the execution META row ({ title,
 // source }). description: the stage row's commitDescription, passed only for a
 // commit that holds the described work.

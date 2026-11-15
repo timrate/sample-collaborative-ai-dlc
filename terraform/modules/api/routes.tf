@@ -1394,6 +1394,14 @@ resource "aws_api_gateway_resource" "intent_resume" {
   path_part   = "resume"
 }
 
+# Pick up pushes made to a parked intent's branch now, instead of at the next
+# stage (the stages sync on their own).
+resource "aws_api_gateway_resource" "intent_sync_branch" {
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  parent_id   = aws_api_gateway_resource.intent.id
+  path_part   = "sync-branch"
+}
+
 resource "aws_api_gateway_resource" "intent_repair" {
   rest_api_id = aws_api_gateway_rest_api.main.id
   parent_id   = aws_api_gateway_resource.intent.id
@@ -1607,6 +1615,7 @@ locals {
     cancel_post            = { resource = aws_api_gateway_resource.intent_cancel.id, method = "POST" }
     rewind_post            = { resource = aws_api_gateway_resource.intent_rewind.id, method = "POST" }
     resume_post            = { resource = aws_api_gateway_resource.intent_resume.id, method = "POST" }
+    sync_branch_post       = { resource = aws_api_gateway_resource.intent_sync_branch.id, method = "POST" }
     delivery_post          = { resource = aws_api_gateway_resource.intent_delivery.id, method = "POST" }
     repair_post            = { resource = aws_api_gateway_resource.intent_repair.id, method = "POST" }
     compose_post           = { resource = aws_api_gateway_resource.intent_compose.id, method = "POST" }
@@ -1759,6 +1768,12 @@ module "cors_intent_resume" {
   source      = "./cors"
   rest_api_id = aws_api_gateway_rest_api.main.id
   resource_id = aws_api_gateway_resource.intent_resume.id
+}
+
+module "cors_intent_sync_branch" {
+  source      = "./cors"
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  resource_id = aws_api_gateway_resource.intent_sync_branch.id
 }
 
 module "cors_intent_repair" {

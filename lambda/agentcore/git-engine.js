@@ -1414,6 +1414,234 @@ export const concludeConflictMerge = async ({
   return { concluded: true, sha: head.stdout.trim() || null, pushed: true };
 };
 
+// ── Branch sync (pick up pushes made outside this session) ──────────────────
+// A person, the AI-DLC CLI or CI can push to the branch a session works on
+// between stages or while a stage is parked. A warm session reuses its
+// checkout without fetching, so without a sync the next stage runs on a stale
+// tree and its push is rejected as non-fast-forward.
+//
+// The suffix of the scratch branch a conflict publishes the local work to. The
+// engine owns it and force-pushes it on every conflict. A person resolves by
+// merging it into the working branch, after which the next sync fast-forwards.
+export const SYNC_CONFLICT_BRANCH_SUFFIX = '--sync-conflict';
+export const syncConflictBranchFor = (branch) => `${branch}${SYNC_CONFLICT_BRANCH_SUFFIX}`;
+
+// Bring the checkout up to date with origin/<branch>: fetch, then fast-forward,
+// else merge with the engine identity. A conflict aborts the merge (tree left
+// as it was), publishes the local work to the scratch conflict branch, and
+// reports the conflicted paths. Uncommitted changes block the sync (the engine
+// commits at every stage exit, so they only remain after a crash). Never
+// throws.
+//   { synced: 'up_to_date' | 'fast_forward' | 'merged', sha, previousSha }
+//   { synced: 'empty' }              — no commits yet (new/empty repo)
+//   { synced: 'no_remote_branch' }   — branch never pushed: nothing to pick up
+//   { synced: false, reason: 'branch_sync_conflict', conflicts, conflictBranch, detail }
+//   { synced: false, reason, detail } — dirty_worktree / fetch / merge failure
+export const syncBranchWithRemote = async ({
+  dir,
+  repo,
+  branch,
+  message,
+  author = null,
+  committer,
+  gitProvider,
+  projectId,
+  executionId,
+  urls = {},
+  git = runGit,
+  withGitCredential = defaultWithGitCredential,
+  resolveGitCommitter = defaultResolveGitCommitter,
+}) => {
+  if (!branch) return { synced: false, reason: 'no_branch' };
+  const head = await git(['rev-parse', 'HEAD'], { cwd: dir });
+  if (head.exitCode !== 0) return { synced: 'empty' };
+  const previousSha = head.stdout.trim();
+
+  await ensureRuntimeExcludes({ dir });
+  const status = await git(['status', '--porcelain', '--untracked-files=no'], { cwd: dir });
+  if (status.exitCode !== 0) {
+    return { synced: false, reason: 'status_failed', detail: status.stderr.trim() };
+  }
+  if (status.stdout.trim() !== '') {
+    return { synced: false, reason: 'dirty_worktree', detail: 'uncommitted changes in the tree' };
+  }
+
+  const credentials = {
+    dir,
+    repo,
+    projectId,
+    executionId,
+    gitProvider,
+    urls,
+    git,
+    withGitCredential,
+  };
+  const fetch = await fetchOrigin(credentials);
+  if (!fetch.fetched) return { synced: false, reason: fetch.reason, detail: fetch.detail };
+
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  const remote = await git(['rev-parse', '--verify', remoteRef], { cwd: dir });
+  if (remote.exitCode !== 0) return { synced: 'no_remote_branch' };
+  if (remote.stdout.trim() === previousSha) {
+    return { synced: 'up_to_date', sha: previousSha, previousSha };
+  }
+
+  // A shallow boundary would make both ancestry checks below read false and
+  // turn a fast-forward into a spurious merge.
+  const history = await ensureMergeBase(credentials, remoteRef, 'HEAD');
+  if (!history.ok) return { synced: false, reason: history.reason, detail: history.detail };
+
+  const remoteContained = await git(['merge-base', '--is-ancestor', remoteRef, 'HEAD'], {
+    cwd: dir,
+  });
+  if (remoteContained.exitCode === 0) {
+    // Local is ahead (an earlier push failed): the push publishes it.
+    return { synced: 'up_to_date', sha: previousSha, previousSha };
+  }
+  const localContained = await git(['merge-base', '--is-ancestor', 'HEAD', remoteRef], {
+    cwd: dir,
+  });
+  if (localContained.exitCode === 0) {
+    const ff = await git(['merge', '--ff-only', remoteRef], { cwd: dir });
+    if (ff.exitCode !== 0) {
+      return { synced: false, reason: 'merge_failed', detail: ff.stderr.trim().slice(-500) };
+    }
+    return { synced: 'fast_forward', sha: remote.stdout.trim(), previousSha };
+  }
+
+  const effectiveCommitter =
+    committer === undefined
+      ? await resolveCommitterFor({
+          projectId,
+          executionId,
+          gitProvider,
+          repo,
+          urls,
+          resolveGitCommitter,
+        }).catch(() => null)
+      : committer;
+  const merge = await git(
+    [
+      ...gitIdentity(author, effectiveCommitter),
+      'merge',
+      '--no-ff',
+      '-m',
+      message || `chore(aidlc): sync ${branch} with the remote`,
+      remoteRef,
+    ],
+    { cwd: dir },
+  );
+  if (merge.exitCode === 0) {
+    const merged = await git(['rev-parse', 'HEAD'], { cwd: dir });
+    return { synced: 'merged', sha: merged.stdout.trim() || null, previousSha };
+  }
+
+  const conflicted = await git(['diff', '--name-only', '--diff-filter=U'], { cwd: dir });
+  const conflicts = conflicted.stdout
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  await git(['merge', '--abort'], { cwd: dir }); // best-effort; no-op when the merge never started
+  const detail = merge.stderr.trim().slice(-500);
+  if (conflicts.length === 0) return { synced: false, reason: 'merge_failed', detail };
+
+  // The local commits may exist only in this session. Publish them so a person
+  // can resolve the conflict outside the platform.
+  const conflictBranch = syncConflictBranchFor(branch);
+  let published = false;
+  try {
+    published = await withAuthenticatedRemote(
+      { ...credentials, requiredAccess: 'write' },
+      async (env) =>
+        (
+          await git(['push', '--force', 'origin', `HEAD:refs/heads/${conflictBranch}`], {
+            cwd: dir,
+            env,
+          })
+        ).exitCode === 0,
+    );
+  } catch {
+    published = false;
+  }
+  return {
+    synced: false,
+    reason: 'branch_sync_conflict',
+    conflicts,
+    conflictBranch: published ? conflictBranch : null,
+    detail,
+  };
+};
+
+// One line per conflicted repo: the paths, and where the local work was kept.
+export const describeSyncConflicts = (results = []) =>
+  results
+    .filter((r) => r.reason === 'branch_sync_conflict')
+    .map((r) => {
+      const paths = (r.conflicts ?? []).slice(0, 20).join(', ');
+      const kept = r.conflictBranch
+        ? `; the session's work is on ${r.conflictBranch} — merge it into the branch, then retry`
+        : "; the session's work could not be published to a conflict branch and stays in the session checkout";
+      return `${r.repo}: conflicts in ${paths || 'unknown paths'}${kept}`;
+    })
+    .join('; ');
+
+// Sync every repo of the intent (see syncBranchWithRemote). Never throws.
+// Returns { ok, changed, conflicted, results }:
+//   ok         — every repo is current (or had nothing to pick up)
+//   changed    — at least one repo moved (fast-forward or merge)
+//   conflicted — at least one repo hit a merge conflict
+export const syncAllBranches = async ({
+  repos = [],
+  workspaceDir,
+  branch,
+  gitProvider,
+  repoProviders = null,
+  projectId,
+  executionId,
+  message,
+  author = null,
+  urlsFor = null,
+  git = runGit,
+  withGitCredential = defaultWithGitCredential,
+  resolveGitCommitter = defaultResolveGitCommitter,
+}) => {
+  const results = [];
+  const multi = repos.length > 1;
+  for (const repo of repos) {
+    const url = typeof repo === 'string' ? repo : repo.url;
+    const provider =
+      (typeof repo === 'object' && repo?.provider) ||
+      repoProviders?.[url] ||
+      gitProvider ||
+      'github';
+    try {
+      const sync = await syncBranchWithRemote({
+        dir: repoTargetDir({ url, workspaceDir, multi }),
+        repo: url,
+        branch,
+        message,
+        author,
+        gitProvider: provider,
+        projectId,
+        executionId,
+        urls: urlsFor ? urlsFor(url) : {},
+        git,
+        withGitCredential,
+        resolveGitCommitter,
+      });
+      results.push({ repo: url, ...sync });
+    } catch (err) {
+      results.push({ repo: url, synced: false, reason: 'engine_crashed', detail: err?.message });
+    }
+  }
+  return {
+    ok: results.every((r) => r.synced),
+    changed: results.some((r) => r.synced === 'fast_forward' || r.synced === 'merged'),
+    conflicted: results.some((r) => r.reason === 'branch_sync_conflict'),
+    results,
+  };
+};
+
 // The deterministic stage-exit hook: commit + (when needed) push every repo of
 // the intent. One call after EVERY stage exit (success, park, fail). Never
 // throws.
@@ -1423,6 +1651,12 @@ export const concludeConflictMerge = async ({
 //               up-to-date remotes are neutral, mirroring v1's aggregation)
 //   committed — at least one repo got a new commit from THIS call (the caller
 //               uses this to decide whether a push failure risks new work)
+//
+// Before pushing, the branch is synced with the remote (syncBranchWithRemote)
+// so a push made during the stage merges instead of failing the push. A
+// result's `sha` stays the stage commit (parked-leg file lists diff it); the
+// sync outcome is reported as `synced`, and a conflict as
+// `reason: 'branch_sync_conflict'` with `conflicts` and `conflictBranch`.
 export const commitAndPushAll = async ({
   repos = [],
   workspaceDir,
@@ -1435,6 +1669,7 @@ export const commitAndPushAll = async ({
   executionId,
   message,
   messages = null, // { [repoUrl]: message } — overrides `message` for those repos
+  syncMessage = null, // merge message when the remote moved during the stage
   author = null,
   urlsFor = null, // (repoUrl) => { clean, auth } — test seam for file:// remotes
   git = runGit,
@@ -1493,12 +1728,43 @@ export const commitAndPushAll = async ({
         results.push({ repo: url, ...commit, provenance, files, pushed: 'up_to_date' });
         continue;
       }
+      // Sync first, so the ahead-file range below is measured against the
+      // fresh tracking ref. A failed fetch is not fatal: the push reports it.
+      const sync = await syncBranchWithRemote({
+        dir,
+        repo: url,
+        branch,
+        message: syncMessage,
+        author,
+        committer,
+        gitProvider: provider,
+        projectId,
+        executionId,
+        urls,
+        git,
+        withGitCredential,
+      });
       const repoProvenance =
         !commit.committed && commit.provenance?.state === 'known'
           ? await aheadFiles({ dir, branch, baseBranch: repoBaseBranch, git })
           : commit.provenance;
       const provenance = toWorkspaceProvenance(repoProvenance);
       const files = provenance.state === 'known' ? provenance.files : null;
+      if (sync.reason === 'branch_sync_conflict') {
+        results.push({
+          repo: url,
+          ...commit,
+          provenance,
+          files,
+          pushed: false,
+          synced: false,
+          reason: 'branch_sync_conflict',
+          detail: sync.detail,
+          conflicts: sync.conflicts,
+          conflictBranch: sync.conflictBranch,
+        });
+        continue;
+      }
       const push = await pushBranch({
         dir,
         repo: url,
@@ -1512,7 +1778,16 @@ export const commitAndPushAll = async ({
         sleep,
         log,
       });
-      results.push({ repo: url, ...commit, provenance, files, ...push });
+      results.push({
+        repo: url,
+        ...commit,
+        provenance,
+        files,
+        ...push,
+        // The stage commit, not a sync merge on top of it.
+        ...(commit.committed ? { sha: commit.sha } : {}),
+        synced: sync.synced,
+      });
     } catch (err) {
       // Defensive: nothing in this module should throw, but a git layer bug
       // must never take down stage bookkeeping.

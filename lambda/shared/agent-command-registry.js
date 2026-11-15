@@ -51,6 +51,7 @@ export const COMMANDS = Object.freeze({
   'merge-lane': command('mergeLane', GRANT_SCOPES.EXECUTION),
   'reconcile-lane': command('reconcileLane', GRANT_SCOPES.EXECUTION),
   'refresh-intent': command('refreshIntent', GRANT_SCOPES.NONE),
+  'sync-branch': command('syncBranch', GRANT_SCOPES.EXECUTION),
   'resolve-conflict': command('resolveConflict', GRANT_SCOPES.CONFLICT, AGENT_AUTH_MODES.EXECUTION),
   'discussion-assist-start': command(
     'discussionAssistStart',

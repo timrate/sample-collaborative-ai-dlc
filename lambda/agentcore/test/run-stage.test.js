@@ -222,6 +222,7 @@ const baseDeps = (overrides = {}) => ({
   // WP2 engine git: hermetic default — no repos in the fake payload means the
   // real hook would no-op anyway, but keep tests off real git entirely.
   commitAndPushAll: async () => ({ ok: true, committed: false, results: [] }),
+  syncAllBranches: async () => ({ ok: true, changed: false, conflicted: false, results: [] }),
   ...overrides,
 });
 
@@ -5297,6 +5298,114 @@ describe('runStage — source self-heal (wiped /mnt/workspace)', () => {
     const res = await runStage({ ...baseArgs, repos: ['acme/api'] }, deps);
     expect(res).toMatchObject({ ok: false, reason: 'workspace_restore_failed' });
     expect(spawned).toBe(false);
+  });
+
+  it('syncs the branch before the agent and records what it picked up', async () => {
+    const order = [];
+    const deps = baseDeps({
+      spawnFn: () => (order.push('spawn'), okSpawn()),
+      ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+      syncAllBranches: async (input) => {
+        order.push('sync');
+        expect(input).toMatchObject({ repos: ['acme/api'], branch: 'aidlc/i1' });
+        expect(input.message).toContain('merge changes pushed to the branch');
+        return {
+          ok: true,
+          changed: true,
+          conflicted: false,
+          results: [{ repo: 'acme/api', synced: 'fast_forward', sha: 'b'.repeat(40) }],
+        };
+      },
+    });
+    const res = await runStage({ ...baseArgs, repos: ['acme/api'], branch: 'aidlc/i1' }, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(order).toEqual(['sync', 'spawn']);
+    const synced = deps.store.calls.find(
+      (c) => c[0] === 'appendEvent' && c[1].type === 'v2.git.synced',
+    );
+    expect(synced?.[1].summary).toContain('acme/api@bbbbbbbb (fast-forward)');
+  });
+
+  it('fails branch_sync_conflict and does NOT spawn when pushed changes conflict', async () => {
+    let spawned = false;
+    const deps = baseDeps({
+      spawnFn: () => ((spawned = true), okSpawn()),
+      ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+      syncAllBranches: async () => ({
+        ok: false,
+        changed: false,
+        conflicted: true,
+        results: [
+          {
+            repo: 'acme/api',
+            synced: false,
+            reason: 'branch_sync_conflict',
+            conflicts: ['src/app.ts'],
+            conflictBranch: 'aidlc/i1--sync-conflict',
+          },
+        ],
+      }),
+    });
+    const res = await runStage({ ...baseArgs, repos: ['acme/api'], branch: 'aidlc/i1' }, deps);
+    expect(res).toMatchObject({ ok: false, reason: 'branch_sync_conflict' });
+    expect(spawned).toBe(false);
+    const failed = deps.store.calls.find(
+      (c) => c[0] === 'updateStageState' && c[1].state === 'FAILED',
+    );
+    expect(failed?.[1].runtimeError).toBe('branch_sync_conflict');
+    const conflict = deps.store.calls.find(
+      (c) => c[0] === 'appendEvent' && c[1].type === 'v2.git.sync_conflict',
+    );
+    expect(conflict?.[1].summary).toContain('src/app.ts');
+    expect(conflict?.[1].summary).toContain('aidlc/i1--sync-conflict');
+  });
+
+  it('records a sync failure and still runs the stage on the current checkout', async () => {
+    let spawned = false;
+    const deps = baseDeps({
+      spawnFn: () => ((spawned = true), okSpawn()),
+      ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+      syncAllBranches: async () => ({
+        ok: false,
+        changed: false,
+        conflicted: false,
+        results: [{ repo: 'acme/api', synced: false, reason: 'fetch_failed' }],
+      }),
+    });
+    const res = await runStage({ ...baseArgs, repos: ['acme/api'], branch: 'aidlc/i1' }, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(spawned).toBe(true);
+    expect(
+      deps.store.calls.some((c) => c[0] === 'appendEvent' && c[1].type === 'v2.git.sync_failed'),
+    ).toBe(true);
+  });
+
+  it('fails branch_sync_conflict when the remote moved during the stage and conflicts', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+      commitAndPushAll: async () => ({
+        ok: false,
+        committed: true,
+        results: [
+          {
+            repo: 'acme/api',
+            committed: true,
+            pushed: false,
+            sha: 'c'.repeat(40),
+            reason: 'branch_sync_conflict',
+            conflicts: ['README.md'],
+            conflictBranch: null,
+          },
+        ],
+      }),
+    });
+    const res = await runStage({ ...baseArgs, repos: ['acme/api'] }, deps);
+    expect(res).toMatchObject({ ok: false, reason: 'branch_sync_conflict' });
+    const failed = deps.store.calls.find(
+      (c) => c[0] === 'updateStageState' && c[1].state === 'FAILED',
+    );
+    expect(failed?.[1].runtimeError).toBe('branch_sync_conflict');
   });
 
   it('does not emit a restored event for a repo-less project (no-op heal)', async () => {
