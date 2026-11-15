@@ -2888,6 +2888,46 @@ describe('createProcessStore — imported continuation marker', () => {
   });
 });
 
+describe('createProcessStore — CLI sync link', () => {
+  const ddb = mockClient(DynamoDBDocumentClient);
+  let store;
+  beforeEach(() => {
+    ddb.reset();
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+    store = createProcessStore({ ddb, tableName: 'v2-proc', clock: () => 'T' });
+  });
+  const link = {
+    repo: 'acme/workspace',
+    provider: 'github',
+    branch: 'cli-work',
+    linkedBy: 'u-1',
+    linkedAt: '2026-08-12T09:00:00.000Z',
+    baselineId: '0b7a2f4e-2c1d-4e8f-9a6b-3d5c7e9f1a2b',
+    lastSyncedSha: 'a'.repeat(40),
+    lastSyncedAt: '2026-08-12T09:00:00.000Z',
+  };
+
+  it('sets exactly the link fields', async () => {
+    await store.updateExecution({ executionId: 'e1', cliSync: { ...link, token: 'x' } });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('cliSync = :cls');
+    expect(input.ExpressionAttributeValues[':cls']).toEqual(link);
+  });
+
+  it('removes the link instead of writing a null attribute', async () => {
+    await store.updateExecution({ executionId: 'e1', cliSync: null });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toMatch(/ REMOVE (.*, )?cliSync\b/);
+  });
+
+  it('rejects a link without a baseline before writing', async () => {
+    await expect(
+      store.updateExecution({ executionId: 'e1', cliSync: { ...link, baselineId: '' } }),
+    ).rejects.toThrow(/invalid cliSync/);
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
+});
+
 describe('createProcessStore — resume marker', () => {
   const ddb = mockClient(DynamoDBDocumentClient);
   let store;

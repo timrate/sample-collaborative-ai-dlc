@@ -62,6 +62,7 @@ import {
   Settings2,
   Trash2,
   TriangleAlert,
+  Unlink,
   Upload,
   Wrench,
   X,
@@ -151,6 +152,7 @@ export default function IntentView() {
   } | null>(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [unlinking, setUnlinking] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [reshapeOpen, setReshapeOpen] = useState(false);
   const [confirmExport, setConfirmExport] = useState(false);
@@ -200,6 +202,22 @@ export default function IntentView() {
       setActionError(err instanceof Error ? err.message : 'Failed to continue the intent');
     } finally {
       setContinuing(false);
+    }
+  };
+
+  // Stop syncing CLI progress from the linked workspace branch.
+  const handleUnlinkCliSync = async () => {
+    if (!projectId || !intentId) return;
+    setUnlinking(true);
+    setActionError(null);
+    try {
+      await intentsService.unlinkCliSync(projectId, intentId);
+      await reload();
+    } catch (err) {
+      setDismissedError(null);
+      setActionError(err instanceof Error ? err.message : 'Failed to unlink the branch');
+    } finally {
+      setUnlinking(false);
     }
   };
 
@@ -388,6 +406,7 @@ export default function IntentView() {
   }
   const isActive = intent.status === 'RUNNING' || intent.status === 'WAITING';
   const importedContinuation = intent.importedContinuation ?? null;
+  const cliSync = intent.cliSync ?? null;
   // An imported intent is FAILED only so the existing rewind path can
   // continue it; it shows the Continue banner instead of a failure.
   const isFailed = intent.status === 'FAILED' && !importedContinuation;
@@ -594,7 +613,13 @@ export default function IntentView() {
               {isImportable && (
                 <DropdownMenuItem onSelect={() => setImportOpen(true)}>
                   <Upload className="mr-2 h-4 w-4" />
-                  Import CLI progress
+                  {cliSync ? 'Sync CLI progress' : 'Import CLI progress'}
+                </DropdownMenuItem>
+              )}
+              {cliSync && (
+                <DropdownMenuItem disabled={unlinking} onSelect={() => void handleUnlinkCliSync()}>
+                  <Unlink className="mr-2 h-4 w-4" />
+                  {unlinking ? 'Unlinking…' : 'Unlink CLI branch'}
                 </DropdownMenuItem>
               )}
               {(isCancellable || isDeletable) && <DropdownMenuSeparator />}
@@ -784,6 +809,17 @@ export default function IntentView() {
             </Button>
           </div>
         </div>
+      )}
+
+      {cliSync && (
+        <p
+          className="flex items-center gap-1.5 text-[12px] text-muted-foreground"
+          data-testid="cli-sync-link"
+        >
+          <GitBranch className="h-3.5 w-3.5" />
+          Syncing CLI progress from {cliSync.repo}@{cliSync.branch}
+          {cliSync.lastSyncedSha ? ` (last synced ${cliSync.lastSyncedSha.slice(0, 7)})` : ''}
+        </p>
       )}
 
       {importedContinuation?.stageId && (
@@ -999,6 +1035,7 @@ export default function IntentView() {
         open={importOpen}
         projectId={projectId}
         intentId={intentId}
+        cliSync={cliSync}
         onClose={() => setImportOpen(false)}
         onImported={() => {
           setImportOpen(false);

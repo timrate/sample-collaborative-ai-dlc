@@ -705,8 +705,8 @@ resource "aws_iam_role_policy" "neptune_artifacts" {
         }
       },
       # The intent cascade (reused by project deletion) also purges each child
-      # intent's native workspace export archives and import uploads, all
-      # versions.
+      # intent's native workspace export archives, import uploads and CLI sync
+      # baselines, all versions.
       {
         Effect = "Allow"
         Action = [
@@ -717,6 +717,7 @@ resource "aws_iam_role_policy" "neptune_artifacts" {
         Resource = [
           "${var.artifacts_bucket_arn}/workflow-exports/*",
           "${var.artifacts_bucket_arn}/workflow-imports/*",
+          "${var.artifacts_bucket_arn}/workflow-sync/*",
           "${var.artifacts_bucket_arn}/yjs-documents/*",
         ]
       },
@@ -725,7 +726,7 @@ resource "aws_iam_role_policy" "neptune_artifacts" {
         Action   = ["s3:ListBucketVersions"]
         Resource = [var.artifacts_bucket_arn]
         Condition = {
-          StringLike = { "s3:prefix" = ["workflow-exports/*", "workflow-imports/*", "yjs-documents/*"] }
+          StringLike = { "s3:prefix" = ["workflow-exports/*", "workflow-imports/*", "workflow-sync/*", "yjs-documents/*"] }
         }
       },
       # Project-tier MCP secrets: the projects lambda lists (set-state only),
@@ -3077,7 +3078,8 @@ resource "aws_iam_role_policy" "intents" {
         # Native workspace export archives: written on export, and purged (all
         # versions) when the owning intent is deleted. Import uploads
         # (workflow-imports/) are presigned for the browser, read on import,
-        # and purged the same way.
+        # and purged the same way. CLI sync baselines (workflow-sync/) are
+        # written on each sync, read on the next, and deleted on unlink.
         Effect = "Allow"
         Action = [
           "s3:PutObject",
@@ -3088,6 +3090,7 @@ resource "aws_iam_role_policy" "intents" {
         Resource = [
           "${var.artifacts_bucket_arn}/workflow-exports/*",
           "${var.artifacts_bucket_arn}/workflow-imports/*",
+          "${var.artifacts_bucket_arn}/workflow-sync/*",
           "${var.artifacts_bucket_arn}/yjs-documents/*",
         ]
       },

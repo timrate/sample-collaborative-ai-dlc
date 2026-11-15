@@ -79,6 +79,7 @@ import {
 } from './v2-process-keys.js';
 
 const bySk = (a, b) => a.sk.localeCompare(b.sk);
+const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
 
 // A DynamoDB Query returns at most 1MB per page; a long run's partition (agent
 // output chunks alone can exceed that) silently truncates without this loop.
@@ -587,6 +588,11 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     // the run was retired and the intent waits for a member to continue it at
     // `stageId` (null when the CLI finished every stage). Cleared on relaunch.
     importedContinuation,
+    // The workspace repository branch this intent syncs CLI progress from
+    // (docs/fork-plan/cli-progress-sync-design.md). Set by an import with Keep
+    // syncing, advanced by each sync, removed by unlink. `baselineId` names the
+    // S3 baseline object (intents/native-import.js syncBaselineKey).
+    cliSync,
     currentPhase,
     currentStage,
     pendingHumanTaskId,
@@ -822,6 +828,30 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       }
       sets.push('importedContinuation = :imc');
       values[':imc'] = { importId, stageId, importedAt };
+    }
+    if (cliSync === null) {
+      removes.push('cliSync');
+    } else if (cliSync !== undefined) {
+      const { repo, provider, branch, linkedBy, linkedAt, baselineId } = cliSync ?? {};
+      const { lastSyncedSha = null, lastSyncedAt = null } = cliSync ?? {};
+      if (
+        ![repo, provider, branch, linkedBy, linkedAt, baselineId].every(isNonEmptyString) ||
+        !(lastSyncedSha === null || isNonEmptyString(lastSyncedSha)) ||
+        !(lastSyncedAt === null || isNonEmptyString(lastSyncedAt))
+      ) {
+        throw new Error('invalid cliSync');
+      }
+      sets.push('cliSync = :cls');
+      values[':cls'] = {
+        repo,
+        provider,
+        branch,
+        linkedBy,
+        linkedAt,
+        baselineId,
+        lastSyncedSha,
+        lastSyncedAt,
+      };
     }
     // The autonomy-ladder decision (docs/v2-parallel.md A2 rule 9), stamped by
     // the orchestrator when the human answers the ladder prompt. Validated at

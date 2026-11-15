@@ -1,13 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { IntentCliSync, NativeImportResult } from '@/services/intents';
 
 const createImportUpload = vi.fn();
 const previewImport = vi.fn();
 const confirmImport = vi.fn();
 const getStatus = vi.fn();
-const getTree = vi.fn();
-const getFileContents = vi.fn();
 const postPresignedUpload = vi.fn();
 
 vi.mock('@/services/intents', () => ({
@@ -20,8 +19,6 @@ vi.mock('@/services/intents', () => ({
 vi.mock('@/services/sourceControl', () => ({
   sourceControlService: {
     getStatus: (...a: unknown[]) => getStatus(...a),
-    getTree: (...a: unknown[]) => getTree(...a),
-    getFileContents: (...a: unknown[]) => getFileContents(...a),
   },
 }));
 vi.mock('@/services/presignedUpload', () => ({
@@ -53,17 +50,42 @@ const preview = {
   warnings: [],
 };
 
-const renderDialog = (onImported = vi.fn()) => {
+const BRANCH = { provider: 'github', repo: 'acme/workspace', branch: 'cli-work' };
+const LINK: IntentCliSync = {
+  ...BRANCH,
+  linkedBy: 'u1',
+  linkedAt: '2026-08-15T09:00:00Z',
+  lastSyncedSha: 'a'.repeat(40),
+  lastSyncedAt: '2026-08-15T09:00:00Z',
+};
+
+const renderDialog = ({
+  onImported = vi.fn<(result: NativeImportResult) => void>(),
+  cliSync = null,
+}: {
+  onImported?: (result: NativeImportResult) => void;
+  cliSync?: IntentCliSync | null;
+} = {}) => {
   render(
     <NativeImportDialog
       open
       projectId="p1"
       intentId="i1"
+      cliSync={cliSync}
       onClose={vi.fn()}
       onImported={onImported}
     />,
   );
   return onImported;
+};
+
+const chooseBranch = async (name: string) => {
+  await userEvent.click(screen.getByRole('tab', { name: 'Repository branch' }));
+  // Only the active binding is offered, and it is preselected.
+  expect(await screen.findByRole('combobox', { name: 'Workspace repository' })).toHaveTextContent(
+    'acme/workspace',
+  );
+  await userEvent.type(screen.getByLabelText('Branch'), name);
 };
 
 beforeEach(() => {
@@ -72,8 +94,6 @@ beforeEach(() => {
     previewImport,
     confirmImport,
     getStatus,
-    getTree,
-    getFileContents,
     postPresignedUpload,
   ]) {
     mock.mockReset();
@@ -110,65 +130,105 @@ describe('NativeImportDialog', () => {
     expect(postPresignedUpload).toHaveBeenCalledWith(expect.any(Object), zip, {
       label: 'workspace.zip',
     });
+    expect(previewImport).toHaveBeenCalledWith('p1', 'i1', { uploadId: 'up-1' });
     expect(confirmImport).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: 'Import progress' }));
-    expect(confirmImport).toHaveBeenCalledWith('p1', 'i1', 'up-1', 'token-1');
+    expect(confirmImport).toHaveBeenCalledWith(
+      'p1',
+      'i1',
+      { uploadId: 'up-1' },
+      expect.objectContaining({ planToken: 'token-1' }),
+    );
     await waitFor(() => expect(onImported).toHaveBeenCalled());
   });
 
-  it('bundles only the workspace record from a branch of an active repository', async () => {
-    getTree.mockResolvedValue({
-      tree: [
-        { path: 'export-manifest.json' },
-        { path: 'aidlc/spaces/default/intents/x/aidlc-state.md' },
-        { path: '.claude/tools/data/stage-graph.json' },
-        { path: 'README.md' },
-      ],
+  it('previews a branch on the backend and confirms with the preview clock', async () => {
+    previewImport.mockResolvedValue({
+      ...preview,
+      headSha: 'a'.repeat(40),
+      plannedAt: '2026-08-15T09:00:00.000Z',
     });
-    getFileContents.mockImplementation(async (_p, _provider, _repo, path) => ({
-      path,
-      content: `content of ${path}`,
-    }));
     renderDialog();
-    await userEvent.click(screen.getByRole('tab', { name: 'Repository branch' }));
-    // Only the active binding is offered, and it is preselected.
-    expect(await screen.findByRole('combobox', { name: 'Workspace repository' })).toHaveTextContent(
-      'acme/workspace',
-    );
-    await userEvent.type(screen.getByLabelText('Branch'), 'cli-work');
+    await chooseBranch('cli-work');
     await userEvent.click(screen.getByRole('button', { name: 'Preview import' }));
 
     await screen.findByTestId('import-preview');
-    expect(getTree).toHaveBeenCalledWith('p1', 'github', 'acme/workspace', 'cli-work');
-    expect(getFileContents.mock.calls.map((call) => call[3]).toSorted()).toEqual([
-      'aidlc/spaces/default/intents/x/aidlc-state.md',
-      'export-manifest.json',
-    ]);
-    const [, body, options] = postPresignedUpload.mock.calls[0];
-    expect(options).toEqual({ label: 'acme/workspace@cli-work' });
-    const bundle = JSON.parse(await (body as Blob).text());
-    expect(bundle.schemaVersion).toBe(1);
-    expect(bundle.files).toContainEqual({
-      path: 'export-manifest.json',
-      content: 'content of export-manifest.json',
-    });
-    expect(createImportUpload).toHaveBeenCalledWith('p1', 'i1', {
-      format: 'json',
-      size: (body as Blob).size,
-    });
+    expect(previewImport).toHaveBeenCalledWith('p1', 'i1', { source: BRANCH });
+    // Nothing is assembled or uploaded in the browser.
+    expect(createImportUpload).not.toHaveBeenCalled();
+    expect(postPresignedUpload).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Import progress' }));
+    expect(confirmImport).toHaveBeenCalledWith(
+      'p1',
+      'i1',
+      { source: BRANCH },
+      expect.objectContaining({ planToken: 'token-1', plannedAt: '2026-08-15T09:00:00.000Z' }),
+    );
   });
 
-  it('explains a branch without an export manifest instead of uploading it', async () => {
-    getTree.mockResolvedValue({ tree: [{ path: 'aidlc/a.md' }] });
+  it('asks to keep syncing, and offers to link a branch with no new progress', async () => {
+    previewImport.mockResolvedValue({
+      ...preview,
+      stageCompletions: [],
+      artifactWrites: [],
+      answeredGates: [],
+    });
     renderDialog();
-    await userEvent.click(screen.getByRole('tab', { name: 'Repository branch' }));
-    await screen.findByRole('combobox', { name: 'Workspace repository' });
-    await userEvent.type(screen.getByLabelText('Branch'), 'main');
+    await chooseBranch('cli-work');
+    await userEvent.click(screen.getByLabelText(/Keep syncing from this branch/));
     await userEvent.click(screen.getByRole('button', { name: 'Preview import' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('no export-manifest.json');
-    expect(createImportUpload).not.toHaveBeenCalled();
+    expect(await screen.findByTestId('import-preview')).toHaveTextContent('no new progress');
+    expect(previewImport).toHaveBeenCalledWith('p1', 'i1', { source: BRANCH, keepSyncing: true });
+    await userEvent.click(screen.getByRole('button', { name: 'Link branch' }));
+    expect(confirmImport).toHaveBeenCalledWith(
+      'p1',
+      'i1',
+      { source: BRANCH, keepSyncing: true },
+      expect.objectContaining({ planToken: 'token-1' }),
+    );
+  });
+
+  it('syncs only from the linked branch', async () => {
+    renderDialog({ cliSync: LINK });
+
+    expect(screen.getByRole('tab', { name: 'Workspace ZIP' })).toBeDisabled();
+    expect(screen.getByTestId('import-linked-branch')).toHaveTextContent('acme/workspace@cli-work');
+    expect(screen.queryByLabelText(/Keep syncing/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Preview import' }));
+    expect(previewImport).toHaveBeenCalledWith('p1', 'i1', { source: BRANCH });
+  });
+
+  it('says so when nothing was pushed since the last sync', async () => {
+    previewImport.mockResolvedValue({ dryRun: true, unchanged: true, headSha: 'a'.repeat(40) });
+    renderDialog({ cliSync: LINK });
+    await userEvent.click(screen.getByRole('button', { name: 'Preview import' }));
+
+    expect(
+      await screen.findByText('Nothing was pushed to the branch since the last sync.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Import progress' })).not.toBeInTheDocument();
+  });
+
+  it('lists conflicts and offers no confirm', async () => {
+    previewImport.mockResolvedValue({
+      ...preview,
+      sync: true,
+      conflicts: [
+        { kind: 'stage', stageId: 'workflow-planning', reason: 'both_completed' },
+        { kind: 'artifact', stageId: 'requirements-analysis', path: 'aidlc/x/requirements.md' },
+      ],
+      uiOwnedFiles: [],
+    });
+    renderDialog({ cliSync: LINK });
+    await userEvent.click(screen.getByRole('button', { name: 'Preview import' }));
+
+    const panel = await screen.findByTestId('import-preview');
+    expect(panel).toHaveTextContent('Workflow Planning was completed in both the CLI and the UI');
+    expect(panel).toHaveTextContent('aidlc/x/requirements.md changed in both the CLI and the UI');
+    expect(screen.queryByRole('button', { name: 'Import progress' })).not.toBeInTheDocument();
   });
 
   it('shows a refusal from the server and offers no confirm', async () => {
@@ -204,5 +264,6 @@ describe('NativeImportDialog', () => {
       await screen.findByText('The CLI workspace has no new progress for this intent.'),
     ).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Import progress' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Link branch' })).not.toBeInTheDocument();
   });
 });

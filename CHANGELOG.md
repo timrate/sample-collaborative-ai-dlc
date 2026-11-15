@@ -9,10 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **Import CLI progress.** A project member can bring workflow progress made in a native AI-DLC harness back to the intent it was exported from, from the workspace ZIP or from a workspace repository branch. Sequential stages the CLI completed are recorded, with their artifacts (marked as imported) and question answers. The intent then waits to be continued at the next stage. The import shows a preview first, and refuses a workspace when the intent changed in the UI after the export. Construction unit progress is not imported yet. See [Importing CLI Progress](docs/using-the-platform/importing-cli-progress.md).
+- **Keep syncing CLI progress from a branch.** A branch import can link the intent to that branch. Later imports from it compare against the last sync instead of the export, so work done in the UI in the meantime is kept, and a stage or artifact changed on both sides is reported as a conflict instead of being imported. **Unlink CLI branch** removes the link. Branch imports are now read on the server through the project's source-control binding instead of being assembled in the browser. Syncing runs when a member imports; automatic syncing between stages is a follow-up. See [Keep syncing from a branch](docs/using-the-platform/importing-cli-progress.md#keep-syncing-from-a-branch).
 
 ### Notes
 
 - **Deployment.** The import adds the `POST /projects/{projectId}/intents/{intentId}/import` and `/import/upload` API routes. It also adds intents Lambda access to the `workflow-imports/` prefix of the artifacts bucket, and a one-day expiry rule for that prefix. Apply Terraform before using it.
+- **Deployment.** CLI sync adds the `DELETE /projects/{projectId}/intents/{intentId}/cli-sync` route, intents and projects Lambda access to the `workflow-sync/` prefix of the artifacts bucket, a lifecycle rule that expires superseded versions under that prefix after one day, and a read-only `branch-head` operation in the source-control Lambda. Apply Terraform and deploy the Lambdas together.
+- **Security.** The credential broker can now issue a **read** credential for an execution's linked workspace repository (`META.cliSync.repo`) while the execution is `CREATED` or `RUNNING`. Write and identity requests for it are refused, and so are bindings whose read credential is not narrower than write (delegated OAuth). Nothing in this release requests that credential yet; it is for the automatic sync step that follows.
 
 ## [2.3.1] - 2026-11-13
 

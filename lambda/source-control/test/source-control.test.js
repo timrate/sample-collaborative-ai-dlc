@@ -149,6 +149,30 @@ describe('source-control project contract', () => {
     expect(stsClient.calls).toHaveLength(1);
   });
 
+  it('reads a branch head with a read-scoped credential', async () => {
+    const stsClient = incompleteSts();
+    await expect(
+      executeSourceControlOperation({
+        projectId: 'p1',
+        provider: 'codecommit',
+        repo: CODECOMMIT_REPO,
+        operation: 'branch-head',
+        args: { branch: 'cli-work' },
+        repos: [{ provider: 'codecommit', repo: CODECOMMIT_REPO }],
+        ddbClient: ddbWithBinding,
+        ssmClient: {},
+        secretsClient: {},
+        stsClient,
+      }),
+    ).rejects.toMatchObject({ code: 'ROLE_ASSUMPTION_FAILED' });
+    expect(stsClient.calls).toHaveLength(1);
+    const actions = JSON.parse(stsClient.calls[0].input.Policy).Statement.flatMap(
+      (statement) => statement.Action,
+    );
+    expect(actions).toContain('codecommit:GitPull');
+    expect(actions).not.toContain('codecommit:GitPush');
+  });
+
   it('refuses a CodeCommit binding whose ref is not its role and external ID pair', async () => {
     // A role-only ref would share one invalidation fan-out across users.
     const roleOnly = { ...CODECOMMIT_BINDING, credentialRef: `codecommit-role#${CODECOMMIT_ROLE}` };

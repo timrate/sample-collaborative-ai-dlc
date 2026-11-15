@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import { formatTimelineTimestamp } from '@/lib/timeAgo';
@@ -65,6 +65,7 @@ vi.mock('@/hooks/useProjectsCache', () => ({
 const get = vi.fn();
 const start = vi.fn();
 const rewind = vi.fn();
+const unlinkCliSync = vi.fn();
 const answerGate = vi.fn();
 const repair = vi.fn();
 const exportWorkflow = vi.fn();
@@ -77,6 +78,7 @@ vi.mock('@/services/intents', () => ({
     get: (...a: unknown[]) => get(...a),
     start: (...a: unknown[]) => start(...a),
     rewind: (...a: unknown[]) => rewind(...a),
+    unlinkCliSync: (...a: unknown[]) => unlinkCliSync(...a),
     answerGate: (...a: unknown[]) => answerGate(...a),
     repair: (...a: unknown[]) => repair(...a),
     exportWorkflow: (...a: unknown[]) => exportWorkflow(...a),
@@ -2594,5 +2596,28 @@ describe('IntentView — imported CLI progress', () => {
     } else {
       expect(screen.queryByText('Import CLI progress')).not.toBeInTheDocument();
     }
+  });
+
+  it('shows the linked CLI branch and unlinks it', async () => {
+    const cliSync = {
+      repo: 'acme/workspace',
+      provider: 'github',
+      branch: 'cli-work',
+      linkedBy: 'u1',
+      linkedAt: '2026-08-15T09:00:00.000Z',
+      lastSyncedSha: 'abcdef1234567890',
+      lastSyncedAt: '2026-08-15T09:00:00.000Z',
+    };
+    get.mockResolvedValue(baseDetail({ status: 'WAITING', cliSync }));
+    unlinkCliSync.mockReset().mockResolvedValue(undefined);
+    renderAt();
+
+    expect(await screen.findByTestId('cli-sync-link')).toHaveTextContent(
+      'Syncing CLI progress from acme/workspace@cli-work (last synced abcdef1)',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Intent actions' }));
+    expect(await screen.findByText('Sync CLI progress')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('Unlink CLI branch'));
+    await waitFor(() => expect(unlinkCliSync).toHaveBeenCalledWith('p1', 'i1'));
   });
 });

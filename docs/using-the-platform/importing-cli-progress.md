@@ -34,10 +34,26 @@ Files the import does not use are listed in the preview and left alone. These in
 A team that pushes the workspace folder to its own repository can import from a branch instead. The [AI-DLC guide](https://github.com/awslabs/aidlc-workflows) calls this the workspace repository. The code repositories stay separate.
 
 1. Commit everything `git status` lists in the workspace folder, including `export-manifest.json`, and push the branch.
-2. Attach the workspace repository to the project and make sure its source-control binding is active. The import reads the branch through the project's source-control binding.
+2. Attach the workspace repository to the project and make sure its source-control binding is active. The platform reads the branch on the server through the project's source-control binding. Only `export-manifest.json`, `aidlc/` and `aidlc-docs/` are read, with the same limits as an upload (5,000 files, 50 MB, 5 MB per file).
 3. In **Import CLI progress**, choose **Repository branch**, pick the repository, enter the branch, and choose **Preview import**.
 
-The AI-DLC CLI does not commit `runtime-graph.json`. The import uses the import time for completions it cannot find in the workspace.
+The AI-DLC CLI does not commit `runtime-graph.json`. The import uses the preview time for completions it cannot find in the workspace. Confirm within 15 minutes of the preview, or preview again.
+
+## Keep syncing from a branch
+
+When the CLI and the UI both keep working on an intent, select **Keep syncing from this branch** before you preview a branch import. The intent is then linked to that branch, and later imports compare the branch with the last sync instead of the export:
+
+- Work done in the UI since the last sync is kept. It is no longer a reason to refuse the import.
+- Stages the CLI completed since the last sync are imported, as long as the UI has not started them.
+- A stage completed on both sides, a stage the CLI completed while it runs in the UI, or an artifact changed on both sides is a **conflict**. The preview lists the conflicts, and nothing is imported until they are reconciled.
+- When nothing was pushed to the branch since the last sync, the preview says so without reading the files again.
+- A sync that brings no new records only records the sync. A parked run is not stopped.
+
+While an intent is linked, the intent page shows **Syncing CLI progress from <repository>@<branch>**. **Intent actions** then offers **Sync CLI progress**, which imports from the linked branch only, and **Unlink CLI branch**. Unlink to import from a ZIP or another branch again. Any project member can link or unlink.
+
+Syncing runs only when someone imports. Automatic syncing between stages is planned as a follow-up.
+
+The sync state is kept in the artifacts bucket under `workflow-sync/<intentId>/` until the branch is unlinked or the intent is deleted.
 
 ## Review and confirm
 

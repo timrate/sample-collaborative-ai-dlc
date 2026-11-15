@@ -49,6 +49,27 @@ const executionIncludesRepository = (meta, provider, repository) => {
   });
 };
 
+// The workspace repository an intent syncs CLI progress from (META.cliSync,
+// set by a project member through the intents import). It is not one of the
+// execution's code repositories, so the engine may only read it.
+const executionLinksRepository = (meta, provider, repository) => {
+  const link = meta?.cliSync;
+  if (!link?.repo || !link.provider || !provider || !repository) return false;
+  if (link.provider !== provider) return false;
+  try {
+    return canonicalRepo(provider, link.repo) === canonicalRepo(provider, repository);
+  } catch {
+    return false;
+  }
+};
+
+// Binding types whose `read` credential is narrower than their `write` one: a
+// GitHub App token minted with read permissions, a CodeCommit session with the
+// read session policy. A delegated OAuth token is the same token for either
+// access, so issuing it for a linked repository would grant write through a
+// read request.
+const READ_SCOPED_AUTH_TYPES = new Set(['github-app', 'codecommit-role']);
+
 const authorizeCredentialRequest = async (
   { executionId, projectId, provider, repository, requiredAccess = 'write' },
   { ddbClient = ddb, ssmClient = ssm, secretsClient = secrets, stsClient = sts } = {},
@@ -83,7 +104,9 @@ const authorizeCredentialRequest = async (
       code: 'EXECUTION_NOT_ACTIVE',
     });
   }
-  if (!executionIncludesRepository(execution, provider, repository)) {
+  const onExecution = executionIncludesRepository(execution, provider, repository);
+  const linkedOnly = !onExecution && executionLinksRepository(execution, provider, repository);
+  if (!onExecution && !(linkedOnly && requiredAccess === 'read')) {
     throw Object.assign(new Error('Repository is not part of this execution'), {
       code: 'REPOSITORY_NOT_ON_EXECUTION',
     });
@@ -92,6 +115,11 @@ const authorizeCredentialRequest = async (
   if (!binding || binding.status !== ACTIVE) {
     throw Object.assign(new Error('Project source-control binding is not active'), {
       code: 'SOURCE_CONTROL_NOT_READY',
+    });
+  }
+  if (linkedOnly && !READ_SCOPED_AUTH_TYPES.has(binding.authType)) {
+    throw Object.assign(new Error('This binding cannot issue a read-only credential'), {
+      code: 'OPERATION_NOT_ALLOWED',
     });
   }
   if (requiredAccess === 'write' && !binding.capabilities?.repositoryWrite) {
@@ -168,6 +196,7 @@ export {
   CREDENTIAL_ACTIVE_EXECUTION_STATUSES,
   authorizeAgentCredentialRequest,
   executionIncludesRepository,
+  executionLinksRepository,
   loggableAgentCredentialErrorCode,
   authorizeCredentialRequest,
 };
