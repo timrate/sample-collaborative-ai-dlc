@@ -81,6 +81,25 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
       noncurrent_days = 1
     }
   }
+
+  # CLI workspace uploads for re-attach import are read once (preview and
+  # confirm) and never needed afterwards.
+  rule {
+    id     = "expire_workflow_imports"
+    status = "Enabled"
+
+    filter {
+      prefix = "workflow-imports/"
+    }
+
+    expiration {
+      days = 1
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+  }
 }
 
 # Code snapshots bucket for agent code outputs

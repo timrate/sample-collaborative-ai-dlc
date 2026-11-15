@@ -2845,6 +2845,49 @@ describe('buildExecutionMeta — unpinned row shape', () => {
   });
 });
 
+describe('createProcessStore — imported continuation marker', () => {
+  const ddb = mockClient(DynamoDBDocumentClient);
+  let store;
+  beforeEach(() => {
+    ddb.reset();
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+    store = createProcessStore({ ddb, tableName: 'v2-proc', clock: () => 'T' });
+  });
+  const marker = {
+    importId: 'import-1',
+    stageId: 'workflow-planning',
+    importedAt: '2026-08-12T09:00:00.000Z',
+  };
+
+  it('sets the marker when one is given', async () => {
+    await store.updateExecution({ executionId: 'e1', importedContinuation: marker });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('importedContinuation = :imc');
+    expect(input.ExpressionAttributeValues[':imc']).toEqual(marker);
+  });
+
+  it('accepts a completed workflow with no continuation stage', async () => {
+    await store.updateExecution({
+      executionId: 'e1',
+      importedContinuation: { ...marker, stageId: null },
+    });
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(1);
+  });
+
+  it('removes the marker instead of writing a null attribute', async () => {
+    await store.updateExecution({ executionId: 'e1', importedContinuation: null });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toMatch(/ REMOVE (.*, )?importedContinuation\b/);
+  });
+
+  it('rejects a malformed marker before writing', async () => {
+    await expect(
+      store.updateExecution({ executionId: 'e1', importedContinuation: { stageId: 'x' } }),
+    ).rejects.toThrow(/invalid importedContinuation/);
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
+});
+
 describe('createProcessStore — resume marker', () => {
   const ddb = mockClient(DynamoDBDocumentClient);
   let store;

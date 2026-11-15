@@ -83,16 +83,23 @@ export function ArtifactViewer({
             </div>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               {artifact.createdAt && new Date(artifact.createdAt).toLocaleString()}
-              {artifact.editedAt && (
-                <>
-                  {' '}
-                  · edited by{' '}
-                  {artifact.editOrigin === 'quorum'
-                    ? 'Quorum'
-                    : artifact.editedByName || 'a member'}{' '}
-                  {new Date(artifact.editedAt).toLocaleString()}
-                </>
-              )}
+              {artifact.editedAt &&
+                (artifact.editOrigin === 'cli-import' ? (
+                  <>
+                    {' '}
+                    · imported from the AI-DLC CLI by {artifact.editedByName || 'a member'}{' '}
+                    {new Date(artifact.editedAt).toLocaleString()}
+                  </>
+                ) : (
+                  <>
+                    {' '}
+                    · edited by{' '}
+                    {artifact.editOrigin === 'quorum'
+                      ? 'Quorum'
+                      : artifact.editedByName || 'a member'}{' '}
+                    {new Date(artifact.editedAt).toLocaleString()}
+                  </>
+                ))}
             </p>
           </div>
           {!editing && (

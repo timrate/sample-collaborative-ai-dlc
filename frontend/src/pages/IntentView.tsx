@@ -62,10 +62,12 @@ import {
   Settings2,
   Trash2,
   TriangleAlert,
+  Upload,
   Wrench,
   X,
   XCircle,
 } from 'lucide-react';
+import { NativeImportDialog } from '@/components/intent/NativeImportDialog';
 
 // The v2 intent page — main-pane content only. All fetch/realtime/output state
 // lives in IntentProvider (mounted by AppShell, shared with the right-hand
@@ -148,6 +150,8 @@ export default function IntentView() {
     message: string;
   } | null>(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [reshapeOpen, setReshapeOpen] = useState(false);
   const [confirmExport, setConfirmExport] = useState(false);
   const [selectedExportHarness, setSelectedExportHarness] = useState<
@@ -184,6 +188,21 @@ export default function IntentView() {
     detail?.intent.status === 'FAILED'
       ? (stageRows.find((stage) => stage.planned && stage.state === 'FAILED') ?? null)
       : null;
+  // After a CLI import the run is retired; continuing is a rewind to the
+  // stage the CLI stopped before.
+  const handleContinueImport = async (stageId: string) => {
+    setContinuing(true);
+    setActionError(null);
+    try {
+      await rewindIntent(stageId);
+    } catch (err) {
+      setDismissedError(null);
+      setActionError(err instanceof Error ? err.message : 'Failed to continue the intent');
+    } finally {
+      setContinuing(false);
+    }
+  };
+
   const handleRecovery = async () => {
     if (!projectId || !intentId) return;
     setStarting(true);
@@ -368,7 +387,11 @@ export default function IntentView() {
     return <Navigate to={`/space/${projectId}/intent/${intentId}/compose`} replace />;
   }
   const isActive = intent.status === 'RUNNING' || intent.status === 'WAITING';
-  const isFailed = intent.status === 'FAILED';
+  const importedContinuation = intent.importedContinuation ?? null;
+  // An imported intent is FAILED only so the existing rewind path can
+  // continue it; it shows the Continue banner instead of a failure.
+  const isFailed = intent.status === 'FAILED' && !importedContinuation;
+  const isImportable = ['WAITING', 'FAILED', 'CANCELLED'].includes(intent.status);
   // The server decides whether a recorded answer still needs its callback
   // re-sent (`resumeAvailable`): the run is live and still parked on that gate,
   // through META for an engine gate or through the asking stage for a question,
@@ -568,6 +591,12 @@ export default function IntentView() {
                   Start a new intent on another AI-DLC version
                 </DropdownMenuItem>
               )}
+              {isImportable && (
+                <DropdownMenuItem onSelect={() => setImportOpen(true)}>
+                  <Upload className="mr-2 h-4 w-4" />
+                  Import CLI progress
+                </DropdownMenuItem>
+              )}
               {(isCancellable || isDeletable) && <DropdownMenuSeparator />}
               {isCancellable && (
                 <DropdownMenuItem disabled={cancelling} onClick={handleCancel}>
@@ -757,6 +786,44 @@ export default function IntentView() {
         </div>
       )}
 
+      {importedContinuation?.stageId && (
+        <div
+          className="rounded border border-agent-waiting/40 bg-agent-waiting/10 px-3 py-3 text-sm"
+          data-testid="imported-continuation"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-medium">
+                <Upload className="h-4 w-4 text-agent-waiting" />
+                CLI progress imported
+              </div>
+              <p className="mt-1 text-[12px] text-muted-foreground">
+                Stages completed in the CLI are recorded and their outputs are marked as imported.
+                Review them, then continue the run at{' '}
+                {humanizeStageId(importedContinuation.stageId)}.
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={continuing}
+              onClick={() => void handleContinueImport(importedContinuation.stageId as string)}
+            >
+              {continuing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              {continuing
+                ? 'Continuing…'
+                : `Continue at ${humanizeStageId(importedContinuation.stageId)}`}
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Stage failures resume from the first failed stage. Pre-stage failures and
           stalled CREATED hand-offs have no rewind target and restart the plan. */}
       {(isFailed || isStalled) && (
@@ -927,6 +994,17 @@ export default function IntentView() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <NativeImportDialog
+        open={importOpen}
+        projectId={projectId}
+        intentId={intentId}
+        onClose={() => setImportOpen(false)}
+        onImported={() => {
+          setImportOpen(false);
+          void reload();
+        }}
+      />
 
       <NativeExportSetupDialog
         exportResult={constructionExport}

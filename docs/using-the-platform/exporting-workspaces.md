@@ -54,9 +54,9 @@ Source repositories and source-control credentials are not bundled in the archiv
 
 Active-stage work that has not reached a completed checkpoint is also excluded from a running-intent export.
 
-!!! warning "Local work is not synchronized back"
+!!! warning "Local work is not synchronized back automatically"
 
-    Decisions, approvals, artifacts, and code changes made in the exported workspace are not synchronized back to the original intent or added to its traceability history. Treat the export as a one-way handoff. Push local code through your normal source-control process if you want to preserve it.
+    Decisions, approvals, artifacts, and code changes made in the exported workspace are not synchronized back to the original intent or added to its traceability history. Push local code through your normal source-control process if you want to preserve it. To bring the workflow progress back, [import the CLI progress](importing-cli-progress.md) into the intent.
 
 ## Set up the downloaded workspace
 

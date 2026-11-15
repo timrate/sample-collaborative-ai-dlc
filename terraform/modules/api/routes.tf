@@ -1278,6 +1278,9 @@ module "cors_aidlc_release_profiles" {
 #   /projects/{projectId}/intents/{intentId}/start                 POST
 #   /projects/{projectId}/intents/{intentId}/cancel                POST
 #   /projects/{projectId}/intents/{intentId}/rewind                POST
+#   /projects/{projectId}/intents/{intentId}/export                POST
+#   /projects/{projectId}/intents/{intentId}/import                POST
+#   /projects/{projectId}/intents/{intentId}/import/upload         POST
 #   /projects/{projectId}/intents/{intentId}/repair                POST
 #   /projects/{projectId}/intents/{intentId}/units/{sectionIndex}/{unitSlug}/feedback GET, POST
 #   /projects/{projectId}/intents/{intentId}/realtime-token        POST
@@ -1322,6 +1325,20 @@ resource "aws_api_gateway_resource" "intent_export" {
   rest_api_id = aws_api_gateway_rest_api.main.id
   parent_id   = aws_api_gateway_resource.intent.id
   path_part   = "export"
+}
+
+# Re-attach CLI progress to an exported intent: presign the workspace upload,
+# then preview (dryRun) and confirm the import.
+resource "aws_api_gateway_resource" "intent_import" {
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  parent_id   = aws_api_gateway_resource.intent.id
+  path_part   = "import"
+}
+
+resource "aws_api_gateway_resource" "intent_import_upload" {
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  parent_id   = aws_api_gateway_resource.intent_import.id
+  path_part   = "upload"
 }
 
 # Aggregated process/graph-read evidence (reads ledger, enrichment spend,
@@ -1581,6 +1598,8 @@ locals {
     item_delete            = { resource = aws_api_gateway_resource.intent.id, method = "DELETE" }
     graph_get              = { resource = aws_api_gateway_resource.intent_graph.id, method = "GET" }
     export_post            = { resource = aws_api_gateway_resource.intent_export.id, method = "POST" }
+    import_post            = { resource = aws_api_gateway_resource.intent_import.id, method = "POST" }
+    import_upload_post     = { resource = aws_api_gateway_resource.intent_import_upload.id, method = "POST" }
     audit_get              = { resource = aws_api_gateway_resource.intent_audit.id, method = "GET" }
     derive_post            = { resource = aws_api_gateway_resource.intent_derive.id, method = "POST" }
     outputs_get            = { resource = aws_api_gateway_resource.intent_outputs.id, method = "GET" }
@@ -1650,6 +1669,18 @@ module "cors_intent_export" {
   source      = "./cors"
   rest_api_id = aws_api_gateway_rest_api.main.id
   resource_id = aws_api_gateway_resource.intent_export.id
+}
+
+module "cors_intent_import" {
+  source      = "./cors"
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  resource_id = aws_api_gateway_resource.intent_import.id
+}
+
+module "cors_intent_import_upload" {
+  source      = "./cors"
+  rest_api_id = aws_api_gateway_rest_api.main.id
+  resource_id = aws_api_gateway_resource.intent_import_upload.id
 }
 
 module "cors_intent_attachments" {

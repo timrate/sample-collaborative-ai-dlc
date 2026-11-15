@@ -29,6 +29,7 @@ import { StageGridEditor } from '@/components/intent/StageGridEditor';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
+import { postPresignedUpload } from '@/services/presignedUpload';
 import {
   Select,
   SelectContent,
@@ -197,23 +198,7 @@ function IntentComposePageContent() {
   }, [projectId, intentId, intent]);
 
   const uploadFile = (upload: { url: string; fields: Record<string, string> }, file: File) =>
-    new Promise<void>((resolve, reject) => {
-      const request = new XMLHttpRequest();
-      request.open('POST', upload.url);
-      request.upload.onprogress = (event) => {
-        if (event.lengthComputable)
-          setUploadProgress(Math.round((event.loaded / event.total) * 100));
-      };
-      request.onerror = () => reject(new Error(`Failed to upload ${file.name}`));
-      request.onload = () =>
-        request.status >= 200 && request.status < 300
-          ? resolve()
-          : reject(new Error(`Failed to upload ${file.name}`));
-      const form = new FormData();
-      for (const [name, value] of Object.entries(upload.fields)) form.append(name, value);
-      form.append('file', file);
-      request.send(form);
-    });
+    postPresignedUpload(upload, file, { label: file.name, onProgress: setUploadProgress });
 
   const handleAttachmentPick = async (files: FileList | null) => {
     if (!projectId || !intentId || !draftReady || !files?.length) return;

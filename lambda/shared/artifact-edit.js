@@ -41,8 +41,10 @@ export const DOWNSTREAM_EDGES = ['CONSUMES', 'DERIVED_FROM', 'CITES'];
 export const CLOSURE_MAX_DEPTH = 12;
 export const CLOSURE_MAX_NODES = 250;
 
-// Artifact edit origins (who changed the content post-hoc).
-export const EDIT_ORIGINS = ['human', 'quorum'];
+// Artifact edit origins (who changed the content post-hoc). `cli-import` is
+// content a project member imported from a native AI-DLC workspace
+// (intents/native-import.js); `edit_ref` names the import.
+export const EDIT_ORIGINS = ['human', 'quorum', 'cli-import'];
 
 /**
  * Pure BFS over an injected async neighbor fetcher. Returns the downstream
@@ -231,9 +233,10 @@ export const applyArtifactEdit = async ({
     .property(cardinality.single, 'edited_at', ts)
     .property(cardinality.single, 'edit_origin', origin)
     .property(cardinality.single, 'edit_ref', String(editRef ?? ''));
-  // Human autosaves share their current CRDT. A Quorum replacement starts a
-  // fresh editor document so a recovered old snapshot cannot overwrite it.
-  if (origin === 'quorum')
+  // Human autosaves share their current CRDT. A Quorum or CLI-import
+  // replacement starts a fresh editor document so a recovered old snapshot
+  // cannot overwrite it.
+  if (origin !== 'human')
     write = write.property(cardinality.single, 'collaboration_epoch', randomUUID());
   const result = await write.id().next();
   if (result.done) {
