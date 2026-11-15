@@ -4173,3 +4173,219 @@ describe('credential-free runtime payloads', () => {
     for (const payload of invokes) expect(payload).not.toHaveProperty('gitAuthor');
   });
 });
+
+// CLI progress sync between stages (docs/fork-plan/cli-progress-sync-design.md,
+// B2). The intents Lambda's internal action is faked at the deps seam.
+describe('CLI progress sync before each sequential stage', () => {
+  const LINK = {
+    repo: 'acme/workspace',
+    provider: 'github',
+    branch: 'cli-work',
+    linkedBy: 'u1',
+    linkedAt: 'T',
+    lastSyncedSha: 'a'.repeat(40),
+    lastSyncedAt: 'T',
+  };
+  const HEAD = 'b'.repeat(40);
+  const CONFLICT = {
+    ok: true,
+    status: 'conflict',
+    headSha: HEAD,
+    conflicts: [
+      { kind: 'artifact', path: 'aidlc-docs/requirements.md', stageId: 'a' },
+      { kind: 'stage', stageId: 'a', reason: 'ui_in_progress' },
+    ],
+  };
+  const UNCHANGED = { ok: true, status: 'unchanged', headSha: HEAD };
+  const synced = (imported, continuationStageId) => ({
+    ok: true,
+    status: 'synced',
+    headSha: HEAD,
+    imported,
+    artifacts: imported.length,
+    continuationStageId,
+  });
+  const start = () =>
+    __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
+  const stepNames = () => ctx.step.mock.calls.map(([name]) => name);
+  const linked = (script) => {
+    deps.store.getExecution = vi.fn(async () => ({ ...META, cliSync: LINK }));
+    deps.syncCliProgress = vi.fn(script);
+  };
+  // Gates are answered once opened, like a person answering in the UI.
+  const answerGatesWith = (decision) => {
+    const opened = new Set();
+    deps.store.createHumanTask = vi.fn(async (input) => {
+      opened.add(input.humanTaskId);
+      return { ...input, status: 'pending' };
+    });
+    deps.store.getHumanTask = vi.fn(async (_executionId, humanTaskId) =>
+      opened.has(humanTaskId) ? { humanTaskId, status: 'answered', answer: { decision } } : null,
+    );
+  };
+  const events = (type) =>
+    deps.store.appendEvent.mock.calls.map(([event]) => event).filter((e) => e.type === type);
+  const conflictGates = () =>
+    deps.store.createHumanTask.mock.calls
+      .map(([input]) => input)
+      .filter((input) => input.humanTaskId.startsWith('eg-cli-sync-conflict-'));
+
+  beforeEach(() => {
+    ctx.step = vi.fn(async (_name, fn) => fn());
+  });
+
+  it('runs no sync step for a run claimed without a link', async () => {
+    deps.syncCliProgress = vi.fn(async () => UNCHANGED);
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true, stages: 2 });
+    expect(deps.syncCliProgress).not.toHaveBeenCalled();
+    expect(stepNames().filter((name) => name.startsWith('cli-sync'))).toEqual([]);
+  });
+
+  it('keeps the step sequence of a run claimed before CLI sync existed', async () => {
+    await start();
+    const unlinkedSteps = stepNames();
+
+    // The same run replayed after a link: the memoized claim has no mode.
+    invokes = [];
+    checkpointInvokes = [];
+    ctx = makeCtx();
+    deps.invokeRuntime = makeRuntime(ctx, okScript);
+    linked(async () => UNCHANGED);
+    // A claim memoized before the field existed has no cliSyncMode.
+    ctx.step = vi.fn(async (name, fn) => {
+      const value = await fn();
+      if (name !== 'mint-run-id') return value;
+      const { cliSyncMode, ...claimed } = value;
+      expect(cliSyncMode).toBe('v1');
+      return claimed;
+    });
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true, stages: 2 });
+    expect(deps.syncCliProgress).not.toHaveBeenCalled();
+    expect(stepNames()).toEqual(unlinkedSteps);
+  });
+
+  it('syncs before each stage and passes over the stages the CLI finished', async () => {
+    linked(async () => UNCHANGED);
+    deps.syncCliProgress.mockResolvedValueOnce(synced(['a'], 'b'));
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    expect(stageStarts().map((p) => p.stageId)).toEqual(['b']);
+    expect(stepNames()).toEqual(expect.arrayContaining(['cli-sync-a', 'cli-sync-b']));
+    expect(deps.syncCliProgress.mock.calls[0][0]).toEqual({
+      projectId: 'p1',
+      intentId: 'i1',
+      orchestratorRunId: expect.stringMatching(/^run-/),
+    });
+  });
+
+  it('finishes without dispatching when the CLI finished every remaining stage', async () => {
+    linked(async () => synced(['a', 'b'], null));
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    expect(stageStarts()).toEqual([]);
+    expect(deps.syncCliProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a conflict gate and keeps the UI's work when asked to", async () => {
+    linked(async (payload) =>
+      payload.resolve ? { ...synced([], 'a'), keptUi: CONFLICT.conflicts } : UNCHANGED,
+    );
+    deps.syncCliProgress.mockResolvedValueOnce(CONFLICT);
+    answerGatesWith('keep-ui-work');
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    const [gate] = conflictGates();
+    expect(gate.humanTaskId).toMatch(/^eg-cli-sync-conflict-a-r0-run-/);
+    expect(gate).toMatchObject({ kind: 'approval', options: ['keep-ui-work', 'stop-run'] });
+    expect(gate.prompt).toContain('aidlc-docs/requirements.md');
+    expect(gate.prompt).toContain('acme/workspace@cli-work');
+    expect(deps.syncCliProgress.mock.calls[1][0]).toMatchObject({
+      resolve: 'keep-ui',
+      expectedHeadSha: HEAD,
+    });
+    expect(stepNames()).toContain('cli-sync-keep-ui-a-r0');
+    expect(stageStarts().map((p) => p.stageId)).toEqual(['a', 'b']);
+  });
+
+  it('fails the run when the person chooses to stop', async () => {
+    linked(async () => CONFLICT);
+    answerGatesWith('stop-run');
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: false, reason: 'cli_sync_stopped' });
+    expect(stageStarts()).toEqual([]);
+    expect(deps.syncCliProgress).toHaveBeenCalledTimes(1);
+    expect(deps.store.updateExecution.mock.calls.map(([input]) => input.status)).toContain(
+      'FAILED',
+    );
+  });
+
+  it('asks again on an unreadable answer, then stops', async () => {
+    linked(async () => CONFLICT);
+    answerGatesWith('maybe');
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: false, reason: 'cli_sync_stopped' });
+    expect(conflictGates()).toHaveLength(3);
+  });
+
+  it('re-syncs when the branch moved while the conflict gate was open', async () => {
+    linked(async () => UNCHANGED);
+    deps.syncCliProgress
+      .mockResolvedValueOnce(CONFLICT)
+      .mockResolvedValueOnce({ ok: false, code: 'cli_sync_head_moved', headSha: 'c'.repeat(40) });
+    answerGatesWith('keep-ui-work');
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    expect(stepNames()).toEqual(
+      expect.arrayContaining(['cli-sync-a', 'cli-sync-keep-ui-a-r0', 'cli-sync-a-r1']),
+    );
+    expect(stageStarts().map((p) => p.stageId)).toEqual(['a', 'b']);
+  });
+
+  it('reports a refused sync once per head and keeps the run going', async () => {
+    linked(async () => ({
+      ok: false,
+      code: 'import_stage_regressed',
+      error: 'stage a was complete at the last sync',
+      headSha: HEAD,
+    }));
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    expect(stageStarts().map((p) => p.stageId)).toEqual(['a', 'b']);
+    expect(deps.syncCliProgress).toHaveBeenCalledTimes(2);
+    const failed = events('v2.cli.sync_failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0].summary).toContain('import_stage_regressed');
+  });
+
+  it('keeps the run going when the intents Lambda cannot be reached', async () => {
+    linked(async () => {
+      throw new Error('Rate exceeded');
+    });
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: true });
+    expect(stageStarts().map((p) => p.stageId)).toEqual(['a', 'b']);
+    const failed = events('v2.cli.sync_failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0].summary).toContain('cli_sync_unavailable');
+  });
+
+  it('exits quietly when the run no longer owns the intent', async () => {
+    linked(async () => ({ ok: false, code: 'cli_sync_not_owner' }));
+    const res = await start();
+
+    expect(res).toEqual({ ok: false, reason: 'retired', intentId: 'i1' });
+    expect(stageStarts()).toEqual([]);
+  });
+});

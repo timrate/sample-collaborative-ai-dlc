@@ -788,6 +788,111 @@ describe('planSync stage markers', () => {
   });
 });
 
+// The conflict gate's "Keep the UI's work": the conflicted items are not
+// imported, and the baseline moves past them to the CLI's side, so the next
+// sync sees only the UI's change there (UI-owned) instead of the conflict.
+describe('planSync keeping the UI work on conflicts', () => {
+  const keepUi = (input) => sync({ ...input, resolveConflicts: 'keep-ui' });
+
+  it('artifact conflict: keeps the UI content, and the next sync treats it as UI-owned', () => {
+    const { ui, baseline } = linked();
+    ui.artifacts[1].content = '# Requirements\n\nEdited in the UI.\n';
+    const files = cliWorkspace();
+    files.set(REQUIREMENTS_PATH, '# Requirements\n\nEdited in the CLI.\n');
+    const plan = keepUi({ files, current: ui, baseline });
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.keptUi).toEqual([
+      { kind: 'artifact', path: REQUIREMENTS_PATH, stageId: 'requirements-analysis' },
+    ]);
+    expect(plan.artifactWrites).toEqual([]);
+    expect(plan.baseline.files[REQUIREMENTS_PATH]).toBe(
+      sha256('# Requirements\n\nEdited in the CLI.\n'),
+    );
+
+    const next = sync({ files, current: ui, baseline: plan.baseline });
+    expect(next.conflicts).toEqual([]);
+    expect(next.artifactWrites).toEqual([]);
+    expect(next.uiOwnedFiles).toEqual([REQUIREMENTS_PATH]);
+  });
+
+  it('a stage the UI started: not imported, and the next sync is quiet', () => {
+    const { ui, baseline } = linked();
+    ui.stageRows.push({
+      stageInstanceId: 'si-planning',
+      stageId: 'workflow-planning',
+      phase: 'inception',
+      state: 'RUNNING',
+      startedAt: '2026-08-12T10:00:00.000Z',
+    });
+    const files = cliPlanned();
+    const plan = keepUi({ files, current: ui, baseline });
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.keptUi).toContainEqual({
+      kind: 'stage',
+      stageId: 'workflow-planning',
+      reason: 'ui_in_progress',
+    });
+    expect(plan.stageCompletions).toEqual([]);
+    expect(plan.artifactWrites).toEqual([]);
+    expect(plan.baseline.stages['workflow-planning'].marker).toBe('x');
+    // The CLI's files for the kept stage are the ancestor now, not a CLI edit
+    // to a stage complete at the baseline.
+    expect(plan.baseline.files[PLAN_PATH]).toBe(sha256('# Plan\n\nFrom the CLI.\n'));
+
+    const next = sync({ files, current: ui, baseline: plan.baseline });
+    expect(next.conflicts).toEqual([]);
+    expect(next.stageCompletions).toEqual([]);
+    expect(next.artifactWrites).toEqual([]);
+  });
+
+  it('both completed: keeps the UI stage and artifact, and the next sync is quiet', () => {
+    const { ui, baseline } = linked();
+    withPlanning(ui, '# Plan\n\nFrom the UI.\n');
+    const files = cliPlanned();
+    const plan = keepUi({ files, current: ui, baseline });
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.keptUi).toEqual([
+      { kind: 'stage', stageId: 'workflow-planning', reason: 'both_completed' },
+      { kind: 'artifact', path: PLAN_PATH, stageId: 'workflow-planning' },
+    ]);
+    expect(plan.stageCompletions).toEqual([]);
+    expect(plan.artifactWrites).toEqual([]);
+
+    const next = sync({ files, current: ui, baseline: plan.baseline });
+    expect(next.conflicts).toEqual([]);
+    expect(next.artifactWrites).toEqual([]);
+    expect(next.uiOwnedFiles).toContain(PLAN_PATH);
+  });
+
+  it('still imports what does not conflict', () => {
+    const { ui, baseline } = linked();
+    ui.artifacts[1].content = '# Requirements\n\nEdited in the UI.\n';
+    const files = cliPlanned();
+    files.set(REQUIREMENTS_PATH, '# Requirements\n\nEdited in the CLI.\n');
+    const plan = keepUi({ files, current: ui, baseline });
+
+    expect(plan.keptUi).toEqual([
+      { kind: 'artifact', path: REQUIREMENTS_PATH, stageId: 'requirements-analysis' },
+    ]);
+    expect(plan.stageCompletions.map((stage) => stage.stageId)).toEqual(['workflow-planning']);
+    expect(plan.artifactWrites.map((write) => write.path)).toEqual([PLAN_PATH]);
+  });
+
+  it('is the default only when asked for', () => {
+    const { ui, baseline } = linked();
+    withPlanning(ui, '# Plan\n\nFrom the UI.\n');
+    const plan = sync({ files: cliPlanned(), current: ui, baseline });
+    expect(plan.conflicts).toHaveLength(2);
+    expect(plan.keptUi).toEqual([]);
+    expect(() =>
+      sync({ files: cliPlanned(), current: ui, baseline, resolveConflicts: 'keep-cli' }),
+    ).toThrow(/resolveConflicts/);
+  });
+});
+
 describe('planSync refusals carried over from the one-shot import', () => {
   it('refuses a completed stage after one that is unfinished on both sides', () => {
     const { ui, baseline } = linkedWithoutProgress();
