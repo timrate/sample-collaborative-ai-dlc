@@ -37,6 +37,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { Plus, Trash2, Workflow as WorkflowIcon, Lock, Package } from 'lucide-react';
+import { HelpTip } from '@/components/help/HelpTip';
 
 // kebab-case, matching the backend id rule.
 const ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -155,7 +156,10 @@ export default function WorkflowList() {
               <WorkflowIcon className="h-7 w-7 text-primary" />
             </div>
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">Workflows</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-3xl font-bold tracking-tight">Workflows</h1>
+                <HelpTip topic="workflows.list" side="right" />
+              </div>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Compose reusable stages into runnable workflows
               </p>

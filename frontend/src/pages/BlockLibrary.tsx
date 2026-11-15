@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Plus, Trash2, Blocks as BlocksIcon, Search, Lock } from 'lucide-react';
 import { BlockLibraryReleaseSection } from './BlockLibraryReleaseSection';
+import { HelpTip } from '@/components/help/HelpTip';
 
 const isBlockType = (v: string | undefined): v is BlockType =>
   !!v && (BLOCK_TYPES as readonly string[]).includes(v);
@@ -112,7 +113,10 @@ export default function BlockLibrary() {
               <BlocksIcon className="h-7 w-7 text-primary" />
             </div>
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">Block Library</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-3xl font-bold tracking-tight">Block Library</h1>
+                <HelpTip topic="workflows.blocks" side="right" />
+              </div>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Reusable stages, scopes, agents, artifacts, sensors, and rules
               </p>

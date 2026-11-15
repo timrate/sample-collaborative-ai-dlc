@@ -29,6 +29,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertCircle, ArrowLeft, ChevronDown, ChevronRight, Info, Loader2, X } from 'lucide-react';
+import { HelpTip } from '@/components/help/HelpTip';
 
 // Non-admins receive the reduced release projection (no sourceSha), so the
 // label falls back to the raw release id rather than crashing.
@@ -444,7 +445,10 @@ export default function NewIntentPage() {
           {hasTrackers && (
             <Card className="flex flex-col lg:max-h-[calc(100vh-12rem)] lg:overflow-y-auto">
               <CardContent className="flex min-h-0 flex-1 flex-col p-4 space-y-3">
-                <Label className="text-sm font-medium">Import from tracker</Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-sm font-medium">Import from tracker</Label>
+                  <HelpTip topic="intent.tracker" />
+                </div>
                 <IntentSourcePicker
                   project={project}
                   selected={
@@ -496,7 +500,10 @@ export default function NewIntentPage() {
             )}
 
             <div>
-              <Label htmlFor="intent-title">Title</Label>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="intent-title">Title</Label>
+                <HelpTip topic="intent.title" />
+              </div>
               <Input
                 id="intent-title"
                 value={title}
@@ -508,12 +515,15 @@ export default function NewIntentPage() {
             </div>
 
             <div>
-              <Label htmlFor="intent-prompt">
-                Prompt
-                {importing && (
-                  <span className="ml-2 text-xs text-muted-foreground">Importing issue…</span>
-                )}
-              </Label>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="intent-prompt">
+                  Prompt
+                  {importing && (
+                    <span className="ml-2 text-xs text-muted-foreground">Importing issue…</span>
+                  )}
+                </Label>
+                <HelpTip topic="intent.prompt" />
+              </div>
               <textarea
                 id="intent-prompt"
                 value={prompt}
@@ -526,7 +536,10 @@ export default function NewIntentPage() {
 
             {showReleaseSelector && (
               <div>
-                <Label htmlFor="intent-methodology-release">AI-DLC version</Label>
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="intent-methodology-release">AI-DLC version</Label>
+                  <HelpTip topic="intent.release" />
+                </div>
                 <Select
                   value={selectedReleaseId ?? '__default__'}
                   onValueChange={(v) => {
@@ -583,21 +596,24 @@ export default function NewIntentPage() {
 
             {repos.length > 0 && (
               <div className="border rounded-md">
-                <button
-                  type="button"
-                  onClick={() => setShowBaseBranch((v) => !v)}
-                  className="w-full flex items-center gap-1.5 px-3 py-2 text-sm font-medium"
-                >
-                  {showBaseBranch ? (
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  ) : (
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  )}
-                  Base branch
-                  <span className="text-xs text-muted-foreground font-normal">
-                    (optional — defaults to each repo's own default branch)
-                  </span>
-                </button>
+                <div className="flex items-center pr-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowBaseBranch((v) => !v)}
+                    className="flex flex-1 items-center gap-1.5 px-3 py-2 text-sm font-medium"
+                  >
+                    {showBaseBranch ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
+                    Base branch
+                    <span className="text-xs text-muted-foreground font-normal">
+                      (optional — defaults to each repo's own default branch)
+                    </span>
+                  </button>
+                  <HelpTip topic="intent.baseBranch" />
+                </div>
                 {showBaseBranch && (
                   <div className="px-3 pb-3 space-y-3">
                     {repos.map((repo) => {

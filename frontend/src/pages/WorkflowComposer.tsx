@@ -35,6 +35,7 @@ import { displayPhasePathForPlacement, visibleWorkflowPhases } from './composer/
 import { mergeReleaseLibraryBlocks } from '@/components/blocks/stageReferenceOptions';
 import { loadWorkflowLibraryRelease } from './composer/workflowLibraryRelease';
 import type { ReleaseBlock } from '@/services/aidlcReleases';
+import { HelpTip } from '@/components/help/HelpTip';
 
 // The compiled view over a release's library when one is in force. A release
 // that cannot be read falls back to the live library rather than failing the
@@ -966,6 +967,7 @@ export default function WorkflowComposer() {
               <TabsTrigger value="validate">Validate</TabsTrigger>
             </TabsList>
           </Tabs>
+          <HelpTip topic="workflows.scopes" />
 
           <WorkflowReleaseStatus
             release={libraryRelease}

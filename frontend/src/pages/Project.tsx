@@ -49,6 +49,7 @@ import { effectiveSprintStatus, isActiveStatus } from '@/lib/sprintStatus';
 import { intentsService, type Intent, type ProjectMetrics } from '@/services/intents';
 import { UsageMetrics } from '@/components/intent/UsageMetrics';
 import { loadPersisted, persist } from '@/lib/persistentCache';
+import { HelpTip } from '@/components/help/HelpTip';
 
 const STATUS_ICON: Record<string, typeof Loader2> = {
   running: Loader2,
@@ -543,6 +544,7 @@ function IntentsView({
           <div className="flex items-center justify-between gap-3 min-h-7">
             <div className="flex items-center gap-2">
               <CardTitle className="text-sm">Intents</CardTitle>
+              <HelpTip topic="space.intents" side="right" />
             </div>
             <div className="flex items-center gap-2">
               {intents.length > 1 && (

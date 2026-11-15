@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
+import { HelpMenu } from '@/components/help/HelpMenu';
 import { ThemeToggle } from '@/components/theme/ThemeToggle';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import {
@@ -156,6 +157,7 @@ export function AppHeader({
       <Separator orientation="vertical" className="h-5" />
 
       {/* Right: theme + activity toggle + user */}
+      <HelpMenu />
       <ThemeToggle />
 
       {(params.sprintId || params.intentId) && (
