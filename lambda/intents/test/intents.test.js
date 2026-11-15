@@ -2964,6 +2964,267 @@ describe('POST /projects/{id}/intents/{intentId}/import (CLI re-attach)', () => 
     expect(res.statusCode).toBe(403);
     expect(meta(intentId).cliSync).toBeDefined();
   });
+
+  // --- Sync from inside a running walk (internal sync-cli-progress action) ---
+
+  const HEAD_2 = 'b'.repeat(40);
+  const syncFromRun = (projectId, intentId, orchestratorRunId = 'run-2') =>
+    handler({ action: 'sync-cli-progress', projectId, intentId, orchestratorRunId });
+
+  // A linked intent that a member continued: run-2 walks from the import's
+  // continuation stage.
+  const running = async () => {
+    const context = await linked();
+    setStatus(context.intentId, {
+      status: 'RUNNING',
+      orchestratorRunId: 'run-2',
+      failureReason: null,
+      importedContinuation: undefined,
+    });
+    context.branch.operations.length = 0;
+    return context;
+  };
+
+  const finishPlanningInCli = ({ cli, branch }, headSha = HEAD_2) => {
+    const state = pathEnding(cli, '/aidlc-state.md');
+    branch.files.set(
+      state,
+      cli.get(state).replace('- [-] workflow-planning', '- [x] workflow-planning'),
+    );
+    branch.headSha = headSha;
+  };
+
+  const stageRow = (intentId, stageId) =>
+    procStore.get(keyOf(`EXEC#${intentId}`, `STAGE#${si(stageId)}`));
+  const deletedKeys = () =>
+    s3Mock.commandCalls(DeleteObjectCommand).map((c) => c.args[0].input.Key);
+
+  it('imports CLI progress for the run that owns the intent, without retiring it', async () => {
+    const context = await running();
+    const { projectId, intentId, uploads } = context;
+    const before = meta(intentId);
+    finishPlanningInCli(context);
+
+    const result = await syncFromRun(projectId, intentId);
+    expect(result).toEqual({
+      ok: true,
+      status: 'synced',
+      headSha: HEAD_2,
+      imported: ['workflow-planning'],
+      artifacts: 0,
+      continuationStageId: null,
+    });
+    expect(stageRow(intentId, 'workflow-planning')).toMatchObject({
+      state: 'SUCCEEDED',
+      stageId: 'workflow-planning',
+    });
+    const after = meta(intentId);
+    expect(after).toMatchObject({ status: 'RUNNING', orchestratorRunId: 'run-2' });
+    expect(after.cliSync).toMatchObject({
+      ...BRANCH,
+      lastSyncedSha: HEAD_2,
+      linkedAt: before.cliSync.linkedAt,
+    });
+    expect(after.cliSync.baselineId).not.toBe(before.cliSync.baselineId);
+    expect(uploads.has(`workflow-sync/${intentId}/${after.cliSync.baselineId}.json`)).toBe(true);
+    expect(deletedKeys()).toContain(`workflow-sync/${intentId}/${before.cliSync.baselineId}.json`);
+    // The walk keeps its runtime session.
+    expect(agentcoreMock.commandCalls(StopRuntimeSessionCommand)).toHaveLength(0);
+    const synced = [...procStore.values()].filter(
+      (row) => row.type === 'Event' && row.eventType === 'v2.cli.synced',
+    );
+    expect(synced.at(-1).summary).toContain('workflow-planning');
+  });
+
+  it('returns unchanged for a replayed head and writes nothing', async () => {
+    const context = await running();
+    const { projectId, intentId, branch } = context;
+    finishPlanningInCli(context);
+    expect((await syncFromRun(projectId, intentId)).status).toBe('synced');
+    const after = meta(intentId);
+    const transactions = ddbMock.commandCalls(TransactWriteCommand).length;
+    branch.operations.length = 0;
+
+    expect(await syncFromRun(projectId, intentId)).toEqual({
+      ok: true,
+      status: 'unchanged',
+      headSha: HEAD_2,
+    });
+    expect(branch.operations).toEqual(['branch-head']);
+    expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(transactions);
+    expect(meta(intentId).cliSync).toEqual(after.cliSync);
+  });
+
+  it('advances the baseline for a push that brings no records, without an event', async () => {
+    const { projectId, intentId, branch } = await running();
+    const before = meta(intentId);
+    const events = () =>
+      [...procStore.values()].filter(
+        (row) => row.type === 'Event' && row.eventType === 'v2.cli.synced',
+      ).length;
+    const eventsBefore = events();
+    branch.headSha = 'c'.repeat(40);
+
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: true,
+      status: 'synced',
+      imported: [],
+      artifacts: 0,
+      continuationStageId: 'workflow-planning',
+    });
+    const after = meta(intentId);
+    expect(after.cliSync.lastSyncedSha).toBe('c'.repeat(40));
+    expect(after.cliSync.baselineId).not.toBe(before.cliSync.baselineId);
+    expect(after).toMatchObject({ status: 'RUNNING', orchestratorRunId: 'run-2' });
+    expect(events()).toBe(eventsBefore);
+  });
+
+  it('plans the same import again after a failure before the stage write commits', async () => {
+    const context = await running();
+    const { projectId, intentId } = context;
+    const before = meta(intentId);
+    finishPlanningInCli(context);
+    transactWriteBarrier = Promise.reject(new Error('DynamoDB unavailable'));
+    transactWriteBarrier.catch(() => {});
+
+    await expect(syncFromRun(projectId, intentId)).rejects.toThrow('DynamoDB unavailable');
+    transactWriteBarrier = null;
+    expect(meta(intentId).cliSync).toEqual(before.cliSync);
+    expect(stageRow(intentId, 'workflow-planning')?.state).not.toBe('SUCCEEDED');
+    // The baseline written for the failed attempt is not left behind.
+    const orphan = deletedKeys().find(
+      (key) => key !== `workflow-sync/${intentId}/${before.cliSync.baselineId}.json`,
+    );
+    expect(orphan).toMatch(new RegExp(`^workflow-sync/${intentId}/`));
+
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: true,
+      status: 'synced',
+      imported: ['workflow-planning'],
+    });
+  });
+
+  it('refuses a caller that does not own the running intent, before reading the branch', async () => {
+    const { projectId, intentId, branch } = await running();
+    const before = meta(intentId);
+
+    expect(await syncFromRun(projectId, intentId, 'run-old')).toMatchObject({
+      ok: false,
+      code: 'cli_sync_not_owner',
+    });
+    setStatus(intentId, { status: 'WAITING' });
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: false,
+      code: 'cli_sync_not_owner',
+    });
+    expect(branch.operations).toEqual([]);
+    expect(meta(intentId).cliSync).toEqual(before.cliSync);
+  });
+
+  it('rejects a malformed request and an intent outside the project', async () => {
+    const { projectId, intentId } = await running();
+    expect(await handler({ action: 'sync-cli-progress', intentId })).toMatchObject({
+      ok: false,
+      code: 'cli_sync_invalid',
+    });
+    expect(await syncFromRun(`p-${randomUUID()}`, intentId)).toMatchObject({
+      ok: false,
+      code: 'cli_sync_not_found',
+    });
+    expect(await syncFromRun(projectId, `i-${randomUUID()}`)).toMatchObject({
+      ok: false,
+      code: 'cli_sync_not_found',
+    });
+  });
+
+  it('reports an intent that is not linked to a branch', async () => {
+    const { projectId, intentId } = await setup();
+    setStatus(intentId, { status: 'RUNNING' });
+    expect(await syncFromRun(projectId, intentId, 'run-1')).toEqual({
+      ok: true,
+      status: 'not_linked',
+    });
+  });
+
+  it('reports a conflict and writes nothing', async () => {
+    const { projectId, intentId, cli, branch } = await running();
+    await g
+      .V()
+      .has('Artifact', 'id', 'requirements')
+      .has('intent_id', intentId)
+      .property(gremlin.process.cardinality.single, 'content', '# Requirements\n\nUI edit.\n')
+      .next();
+    const requirements = pathEnding(cli, '/requirements-analysis/requirements.md');
+    branch.files.set(requirements, '# Requirements\n\nCLI edit.\n');
+    branch.headSha = 'd'.repeat(40);
+    const before = meta(intentId);
+    const baselineWrites = () =>
+      s3Mock
+        .commandCalls(PutObjectCommand)
+        .filter((c) => c.args[0].input.Key.startsWith(`workflow-sync/${intentId}/`)).length;
+    const writesBefore = baselineWrites();
+
+    expect(await syncFromRun(projectId, intentId)).toEqual({
+      ok: true,
+      status: 'conflict',
+      headSha: 'd'.repeat(40),
+      conflicts: [{ kind: 'artifact', path: requirements, stageId: 'requirements-analysis' }],
+    });
+    expect(meta(intentId)).toEqual(before);
+    expect(baselineWrites()).toBe(writesBefore);
+  });
+
+  it('returns the refusal code when the CLI rewound a completed stage', async () => {
+    const { projectId, intentId, cli, branch } = await running();
+    const state = pathEnding(cli, '/aidlc-state.md');
+    branch.files.set(
+      state,
+      cli.get(state).replace('- [x] requirements-analysis', '- [-] requirements-analysis'),
+    );
+    branch.headSha = 'e'.repeat(40);
+    const before = meta(intentId);
+
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: false,
+      code: 'import_stage_regressed',
+      headSha: 'e'.repeat(40),
+      error: expect.stringContaining('requirements-analysis'),
+    });
+    expect(meta(intentId)).toEqual(before);
+  });
+
+  it('returns import_source_unavailable when the branch cannot be read', async () => {
+    const { projectId, intentId } = await running();
+    sourceControlOperationHandler = () => {
+      throw Object.assign(new Error('nope'), { code: 'REPOSITORY_NOT_ON_PROJECT' });
+    };
+    expect(await syncFromRun(projectId, intentId)).toMatchObject({
+      ok: false,
+      code: 'import_source_unavailable',
+      headSha: null,
+    });
+  });
+
+  it('refuses mid-run when the import would answer an open gate', async () => {
+    const { sub, projectId, intentId, uploads } = await setup();
+    keepS3Writes(uploads);
+    const exported = await exportFiles(sub, projectId, intentId);
+    const branch = serveBranch(exported);
+    const { confirm } = await fromBranch(sub, projectId, intentId, { keepSyncing: true });
+    expect(confirm.statusCode, confirm.body).toBe(200);
+    setStatus(intentId, { status: 'RUNNING' });
+    branch.files = new Map(advanceInCli(exported));
+    branch.headSha = HEAD_2;
+    const before = meta(intentId);
+
+    expect(await syncFromRun(projectId, intentId, 'run-1')).toMatchObject({
+      ok: false,
+      code: 'cli_sync_gate_open',
+      headSha: HEAD_2,
+    });
+    expect(procStore.get(keyOf(`EXEC#${intentId}`, 'HUMAN#q-req')).status).toBe('pending');
+    expect(meta(intentId)).toEqual(before);
+  });
 });
 
 describe('unit PR review feedback', () => {

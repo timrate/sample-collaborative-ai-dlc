@@ -1231,6 +1231,78 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     return Attributes;
   };
 
+  // A CLI progress sync from inside a running walk (intents sync-cli-progress,
+  // docs/fork-plan/cli-progress-sync-design.md). The imported stages become
+  // SUCCEEDED and META switches to the new baseline in ONE transaction, which
+  // commits only while `orchestratorRunId` still owns the RUNNING execution
+  // and every stage row is still in the state the sync was planned against
+  // (`expectedState`, null for a stage with no row). A failure leaves the
+  // previous baseline in effect, so a retry plans the same import again.
+  const completeSyncedStages = async ({
+    executionId,
+    orchestratorRunId,
+    completions,
+    aidlcRepoRef = null,
+    cliSync,
+  }) => {
+    if (!orchestratorRunId) throw new Error('completeSyncedStages requires orchestratorRunId');
+    const ts = now();
+    const stageWrites = completions.map((completion) => {
+      const { stageInstanceId, expectedState = null } = completion;
+      if (expectedState === null) {
+        return {
+          Put: {
+            TableName: table(),
+            Item: {
+              ...buildStageRow({
+                executionId,
+                stageInstanceId,
+                stageId: completion.stageId,
+                phase: completion.phase,
+                state: 'SUCCEEDED',
+                aidlcRepoRef,
+                now: ts,
+              }),
+              completedAt: completion.completedAt,
+            },
+            ConditionExpression: 'attribute_not_exists(pk)',
+          },
+        };
+      }
+      return {
+        Update: {
+          TableName: table(),
+          Key: stageKey(executionId, stageInstanceId),
+          UpdateExpression:
+            'SET #state = :state, updatedAt = :ts, GSI2SK = :g2sk, runtimeError = :err, completedAt = :ca, pendingHumanTaskId = :ph',
+          ConditionExpression: '#state = :expected',
+          ExpressionAttributeNames: { '#state': 'state' },
+          ExpressionAttributeValues: {
+            ':state': 'SUCCEEDED',
+            ':expected': expectedState,
+            ':ts': ts,
+            ':g2sk': executionTypeStateIndex({
+              executionId,
+              type: 'STAGE',
+              state: 'SUCCEEDED',
+              id: stageInstanceId,
+            }).GSI2SK,
+            ':err': null,
+            ':ca': completion.completedAt,
+            ':ph': null,
+          },
+        },
+      };
+    });
+    return updateExecution({
+      executionId,
+      fromStatus: 'RUNNING',
+      ifOrchestratorRunId: orchestratorRunId,
+      cliSync,
+      additionalWrites: stageWrites,
+    });
+  };
+
   // Reconcile a detached stage job that the orchestrator has declared failed.
   // The callback id is the attempt ownership token: a delayed callback timeout
   // from an older attempt must never overwrite a retry/resume that has already
@@ -3829,6 +3901,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     claimStageAttempt,
     getStage,
     updateStageState,
+    completeSyncedStages,
     failRunningStageAttempt,
     resumeStageRow,
     appendEvent,

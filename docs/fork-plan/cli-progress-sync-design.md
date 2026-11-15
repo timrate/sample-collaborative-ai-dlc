@@ -123,6 +123,39 @@ Other details fixed in B1:
   - `import_sync_conflict` on a confirm that has conflicts.
   - `import_sync_baseline_invalid` when the baseline is missing.
 
+## Internal sync action (between B1 and B2)
+
+This replaces the runtime command (B1 step 3). It was decided on 2026-11-15, after B1 showed that the runtime could not run the sync (see "B1 as built", item 1).
+
+**Why the intents Lambda.** The orchestrator has no graph access, but it already calls the source-control Lambda directly for binding-checked operations (`defaultSourceControlOperation`). The intents Lambda already accepts internal actions next to its API routes, such as `repair-durable-executions`. An internal action there reuses everything B1 built: the projection, the writer, the baseline store and the branch read through the source-control Lambda. No code moves to `lambda/shared`, the runtime needs no new engine-data operations, and the broker needs no new rule.
+
+**Request.** `{ action: 'sync-cli-progress', projectId, intentId, orchestratorRunId }`, sent by direct Lambda invocation. API Gateway events never carry a top-level `action`, so the action has no API route.
+
+**Ownership.** The caller must own the run: META is `RUNNING` and names `orchestratorRunId`. The action checks this before reading the branch. It then fences the write itself. The imported stage rows and the switch to the new baseline commit in one DynamoDB transaction (`completeSyncedStages` in the process store). That transaction requires `status = RUNNING`, the same `orchestratorRunId`, and each stage row still in the state the sync was planned against. A cancel, rewind or relaunch during the sync therefore writes no stage and leaves the previous baseline in effect.
+
+**Unlike the import endpoint**, the action does not retire the run, stop the runtime session, or set `importedContinuation`. The calling run keeps walking and moves past the imported stages (B2 item 3).
+
+**Results.** Expected outcomes are results, not errors. An unexpected failure throws, and the caller's durable step retries it.
+
+| Result                                                                              | Meaning                                                                                                                                                                      | Writes                                                                      |
+| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `{ ok: true, status: 'not_linked' }`                                                | META has no `cliSync`.                                                                                                                                                       | none                                                                        |
+| `{ ok: true, status: 'unchanged', headSha }`                                        | The head equals `lastSyncedSha`. Only `branch-head` was read.                                                                                                                | none                                                                        |
+| `{ ok: true, status: 'synced', headSha, imported, artifacts, continuationStageId }` | Imported the listed stages. `continuationStageId` is `null` when the CLI finished every stage. A push that brings no records still advances the baseline.                    | artifacts, stage rows, baseline, `v2.cli.synced` event when records changed |
+| `{ ok: true, status: 'conflict', headSha, conflicts }`                              | Both sides changed a stage or artifact. B2 opens the conflict gate.                                                                                                          | none                                                                        |
+| `{ ok: false, code: 'cli_sync_not_owner' }`                                         | The run no longer owns the intent, or it is not `RUNNING`.                                                                                                                   | none                                                                        |
+| `{ ok: false, code: 'cli_sync_changed', headSha }`                                  | The ownership or stage-row check failed at commit.                                                                                                                           | artifacts may be written (see below)                                        |
+| `{ ok: false, code: 'cli_sync_gate_open', headSha }`                                | The CLI finished a stage whose gate is still open in the UI. Answering gates mid-walk belongs to the gate flow, not to a sync.                                               | none                                                                        |
+| `{ ok: false, code: 'import_*', headSha }`                                          | A planner or source refusal from B1, such as `import_stage_regressed`, `import_scope_changed` or `import_source_unavailable`. B2 records `v2.cli.sync_failed` once per head. | none                                                                        |
+| `{ ok: false, code: 'cli_sync_invalid' \| 'cli_sync_not_found' }`                   | Missing fields, or the intent is not in that project.                                                                                                                        | none                                                                        |
+
+**Idempotency per head SHA.** Artifacts (Neptune) are written before the stage transaction, because Neptune and DynamoDB cannot commit together. A failure between them leaves the artifacts with the CLI's content and the baseline unchanged. The retried plan sees UI content equal to CLI content, which `planSync` treats as agreement: it re-imports only the stages and writes no artifact again. After a successful commit, `lastSyncedSha` equals the head, so a replay returns `unchanged`. The S3 object written for a failed attempt is deleted.
+
+**What this changes in B2.**
+
+- Item 2: the durable step invokes the intents Lambda action. B2 adds the orchestrator's invoke permission and a function-name environment variable, together with the caller.
+- Item 5: a write cannot fail part-way for stages, because they commit in one transaction. `cli_sync_changed` and `cli_sync_not_owner` mean the run lost the intent, and the walk exits the way it does for any ownership loss.
+
 ## B2: orchestrator step, gate and UI
 
 1. **When:** before each sequential (once-per-workflow) stage in the walk, when `META.cliSync` is set. It never runs inside a parallel section, and never for per-unit stages.
